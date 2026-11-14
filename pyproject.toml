@@ -1,19 +1,77 @@
 [project]
 name = "micropython-i2c-toolkit"
 version = "0.0.0"
-description = "Host-side tooling for developing and driving the MicroPython I2C harness"
-requires-python = ">=3.11"
+description = "PyVISA-style I2C connection layer, drivers and routing for MicroPython boards"
+requires-python = ">=3.13"  # micropylab needs 3.13
 dependencies = [
-    "mpremote>=1.28",
-    "jupyterlab>=4.6",
-    "jupyter_micropython_kernel>=0.1.3",
-    "jupytext>=1.19",
+    "micropylab[plot]",          # kernel "MicroPython (micropylab)" + side panel + board service
+    "jupyterlab>=4.6.5",
+    "jupyter-collaboration>=5.0.4",
+    "jupyterlab-cell-review",    # Claude Code cell-review add-on
+    "jupytext>=1.19.6",
+    "mpremote==1.29.0",          # same pin as micropylab
 ]
 
 [dependency-groups]
 dev = [
-    "ruff>=0.15",
+    "ipytest>=0.14.2",           # dev notebooks: %%ipytest test cells
+    "ipython>=9.17.1",
+    "jupyter-lab-extractor[cli] @ git+https://github.com/GProtoZeroW/jupyter_lab_extractor.git@v0.1.0",  # jlx pair / jlx run
+    "pytest>=8",
+    "ruff>=0.17.4",
 ]
 
-[tool.uv]
-package = false
+[build-system]
+requires = ["uv_build>=0.11.33,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "micropython_i2c"  # src/micropython_i2c, installed editable so the host can import it
+
+[tool.uv.sources]
+# Sibling checkout, editable: changes to micropylab show up here without a reinstall
+# (restart Lab for server-side changes, the kernel for kernel-side ones).
+micropylab = { path = "../micropylab", editable = true }
+jupyterlab-cell-review = { git = "https://github.com/GProtoZeroW/jupyter_lab_ai_partner.git", rev = "fcc95cab9d9ff8e05c47d534d3b46fe977af5e74" }
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+extend-exclude = ["archive", "*.ipynb"]  # notebooks: the jupytext .py twin is linted
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+# Board code targets MicroPython: str.format and plain classes on purpose.
+ignore = ["UP031", "UP032", "UP004", "B905"]  # B905: MicroPython zip() has no strict=
+
+[tool.ruff.lint.per-file-ignores]
+# Notebooks: imports after the reload cell, long check() lines, magics as comments.
+# I001 off: the import sorter treats the .py as one file and moves imports across cells
+# (it emptied a %%writefile test-file header once).
+"notebooks/*.py" = ["E402", "E501", "F821", "I001"]
+"dev_notebooks/*.py" = ["E402", "E501", "F811", "F821", "I001"]
+# Files written by dev notebooks: the extractor's "# Source:" headers set the spacing, and the
+# next run rewrites them anyway. Still linted for real errors; add each converted module here.
+"src/micropython_i2c/drivers/tmp102.py" = ["I001"]
+"tests/test_tmp102.py" = ["I001"]
+"src/micropython_i2c/drivers/tca9548a.py" = ["I001"]
+"tests/test_tca9548a.py" = ["I001"]
+"src/micropython_i2c/drivers/tmag5273.py" = ["I001"]
+"tests/test_tmag5273.py" = ["I001"]
+
+[tool.ruff.format]
+exclude = [  # dev-notebook output (see the per-file-ignores above)
+    "src/micropython_i2c/drivers/tmp102.py",
+    "tests/test_tmp102.py",
+    "src/micropython_i2c/drivers/tca9548a.py",
+    "tests/test_tca9548a.py",
+    "src/micropython_i2c/drivers/tmag5273.py",
+    "tests/test_tmag5273.py",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["micropython_i2c"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--import-mode=prepend"]  # ipytest finds no tests under importlib mode

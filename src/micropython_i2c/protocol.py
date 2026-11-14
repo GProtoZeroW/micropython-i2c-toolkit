@@ -1,0 +1,247 @@
+"""Protocol mixins: ``RegisterI2CBase`` (register-mapped) and ``CommandI2CBase`` (opcode).
+
+Both call only the four transport methods from ``I2CNode`` and never take a lock, so
+they compose with ``I2CDevice`` *or* ``I2CMux``. Neither defines ``__init__``, which
+keeps the MRO trivial for driver authors::
+
+    class Sensor(RegisterI2CBase, I2CDevice): ...
+    class GasSensor(CommandI2CBase, I2CDevice): ...
+    class CheckedSensor(RegisterI2CBase, CRCMixin, I2CDevice): ...
+
+Naming is ``noun_verb`` throughout (``reg_read``, ``field_set``, ``crc_verify``) so
+related operations sort together.
+
+Rule of thumb for where a fact lives: if the datasheet states it once for the chip it is
+a class attribute (endianness, default register width, opcode width, CRC parameters);
+if it varies per register it is a per-call argument (``nbytes``, ``tolerance``).
+"""
+
+from micropython_i2c.bits import BitTools
+from micropython_i2c.crc import CRCMixin
+
+
+class RegisterI2CBase(BitTools):
+    """Register-mapped devices: shadow cache, confirmed writes, bitfields, coded fields.
+
+    Two access pairs, and the difference matters:
+
+    * ``reg_read`` / ``reg_write`` are **raw**: no cache, no verification. For
+      write-only registers, reads with side effects, write-1-to-clear bits and
+      handshake bits that read back inverted.
+    * ``reg_get`` / ``reg_set`` are **managed**: ``reg_get`` serves from the shadow
+      cache; ``reg_set`` reads back from the device, compares, raises on mismatch and
+      caches only the confirmed value. These are the default.
+
+    Verification compares only the bits expected to read back as written. The mask is
+    the per-call ``verify_mask``, else ``VERIFY_MASKS[reg]``, else ``VERIFY_MASK``,
+    else every bit. ``tolerance`` switches to a numeric comparison for registers the
+    part quantises (DACs, current limits); it and a mask are mutually exclusive.
+
+    The cache is only as trustworthy as the driver's discipline: cache configuration,
+    and pass ``refresh=True`` for anything measured, status-like or self-clearing.
+
+    Class attributes:
+        BIG_ENDIAN: Byte order of multi-byte registers.
+        REG_BYTES: Default register width; override per call with ``nbytes``.
+        VERIFY_MASK: Chip-wide verify mask, or None for all bits.
+        VERIFY_MASKS: ``{reg: mask}`` for registers that need their own mask.
+    """
+
+    BIG_ENDIAN = True
+    REG_BYTES = 2
+    VERIFY_MASK = None
+    VERIFY_MASKS = {}
+
+    # Cache: {reg: (nbytes, value)}. Width is stored so a read at a different width is
+    # a miss rather than a stale-width hit. Created lazily so no __init__ is needed.
+
+    @property
+    def reg_cache(self):
+        """The shadow cache, ``{reg: (nbytes, value)}``. Created on first access."""
+        try:
+            return self._rc
+        except AttributeError:
+            self._rc = {}
+            return self._rc
+
+    def cached(self, reg):
+        """Return the cached value of ``reg``, or None if it is not cached."""
+        entry = self.reg_cache.get(reg)
+        return None if entry is None else entry[1]
+
+    def cache_clear(self, reg=None):
+        """Drop ``reg`` from the cache, or everything if ``reg`` is None.
+
+        Use after anything that changes the device behind the driver's back: a
+        general-call reset, a power cycle, a reset line.
+        """
+        if reg is None:
+            self.reg_cache.clear()
+        else:
+            self.reg_cache.pop(reg, None)
+
+    def _width(self, nbytes):
+        return self.REG_BYTES if nbytes is None else nbytes
+
+    # Raw access.
+
+    def reg_read(self, reg, nbytes=None):
+        """Read a register and assemble it into an int. Always hits the bus."""
+        nbytes = self._width(nbytes)
+        return self.bytes_to_int(self.read_mem(reg, nbytes), self.BIG_ENDIAN)
+
+    def reg_write(self, reg, value, nbytes=None):
+        """Write an int to a register (truncated to width). No verify, no cache update."""
+        nbytes = self._width(nbytes)
+        self.write_mem(reg, self.int_to_bytes(value, nbytes, self.BIG_ENDIAN))
+
+    # Managed access.
+
+    def reg_get(self, reg, nbytes=None, refresh=False):
+        """Return a register's value, from the cache when it holds one at this width."""
+        nbytes = self._width(nbytes)
+        entry = self.reg_cache.get(reg)
+        if refresh or entry is None or entry[0] != nbytes:
+            entry = (nbytes, self.reg_read(reg, nbytes))
+            self.reg_cache[reg] = entry
+        return entry[1]
+
+    def verify_mask_for(self, reg):
+        """The mask ``reg_set`` uses for ``reg`` when none is passed (None = all bits)."""
+        return self.VERIFY_MASKS.get(reg, self.VERIFY_MASK)
+
+    def reg_set(self, reg, value, nbytes=None, tolerance=0, verify_mask=None, validator=None):
+        """Write a register, read it back from the device, and confirm it took.
+
+        Args:
+            reg: Register number.
+            value: Value requested.
+            nbytes: Register width; defaults to ``REG_BYTES``.
+            tolerance: Largest acceptable ``|read-back - value|``. 0 means bitwise.
+            verify_mask: Compare only these bits. Defaults to ``verify_mask_for(reg)``.
+            validator: Called as ``validator(value)`` before any bus traffic; should
+                raise on a bad value, so a rejected request costs nothing.
+
+        Returns:
+            The value read back, which may differ from the request within tolerance
+            or in masked-off bits.
+
+        Raises:
+            ValueError: If the read-back fails the comparison.
+        """
+        if validator is not None:
+            validator(value)
+        nbytes = self._width(nbytes)
+        mask = verify_mask if verify_mask is not None else self.verify_mask_for(reg)
+
+        self.reg_write(reg, value, nbytes)
+        actual = self.reg_read(reg, nbytes)
+
+        if tolerance:
+            ok = abs(actual - value) <= tolerance
+            detail = "tol {}".format(tolerance)
+        elif mask is not None:
+            ok = (actual & mask) == (value & mask)
+            detail = "mask {:#x}".format(mask)
+        else:
+            ok = actual == value
+            detail = "exact"
+        if not ok:
+            raise ValueError(
+                "reg {:#04x}: wrote {:#x}, device holds {:#x} ({})".format(
+                    reg, value, actual, detail
+                )
+            )
+        self.reg_cache[reg] = (nbytes, actual)
+        return actual
+
+    # Bitfields: ``field`` is a (shift, width) tuple declared on the driver class.
+
+    def field_get(self, reg, field, nbytes=None, refresh=True):
+        """Read a field. Fresh by default, since fields sit beside live status bits."""
+        return self.field_extract(self.reg_get(reg, nbytes, refresh=refresh), field)
+
+    def field_set(self, reg, field, value, nbytes=None, **kw):
+        """Read-modify-write one field from a fresh read, verified via ``reg_set``.
+
+        Extra keyword arguments (notably ``verify_mask``) go to ``reg_set``.
+        """
+        current = self.reg_read(reg, nbytes)
+        return self.reg_set(reg, self.field_insert(current, field, value), nbytes, **kw)
+
+    def flag_get(self, reg, field, refresh=True):
+        """Read a one-bit field as a bool."""
+        return bool(self.field_get(reg, field, refresh=refresh))
+
+    def flag_set(self, reg, field, enable, **kw):
+        """Write a one-bit field from a truthy value."""
+        return self.field_set(reg, field, 1 if enable else 0, **kw)
+
+    # Coded fields: the bit pattern indexes a {code: physical value} table.
+
+    def coded_get(self, reg, field, table, nbytes=None, refresh=True):
+        """Read a coded field and map it through ``table``."""
+        return table[self.field_get(reg, field, nbytes, refresh=refresh)]
+
+    def coded_set(self, reg, field, table, value, nbytes=None, **kw):
+        """Map ``value`` back to its code and write it.
+
+        Raises:
+            ValueError: Listing the accepted values, if ``value`` is not in ``table``.
+        """
+        for code, v in table.items():
+            if v == value:
+                return self.field_set(reg, field, code, nbytes, **kw)
+        raise ValueError("{!r} not in {}".format(value, sorted(table.values())))
+
+
+class CommandI2CBase(CRCMixin):
+    """Command-driven devices: send an opcode, read 16-bit words each followed by a CRC.
+
+    Wire format of a response, checksum per word (so n words is 3n bytes)::
+
+        [ MSB | LSB | CRC ] [ MSB | LSB | CRC ] ...
+
+    A command-driven sensor returns a bare number with nothing to sanity-check it
+    against, so ``words_read`` verifies by default and raises on a mismatch.
+
+    Defaults are the Sensirion convention (CRC-8, poly 0x31, init 0xFF). A part from
+    another vendor overrides whichever ``CRC_*`` differ.
+
+    Class attributes:
+        CMD_BYTES: Opcode width in bytes.
+    """
+
+    CMD_BYTES = 2
+    CRC_POLY = 0x31
+    CRC_INIT = 0xFF
+
+    def cmd_send(self, opcode):
+        """Send ``opcode`` (an int, as the datasheet prints it), MSB first.
+
+        Settling delays between command and read are part-specific and belong in the
+        driver.
+        """
+        self.write_raw(self.int_to_bytes(opcode, self.CMD_BYTES, True))
+
+    def words_read(self, n_words, check=True):
+        """Read ``n_words`` 16-bit words in one transfer, verifying each word's CRC.
+
+        Args:
+            n_words: Number of words expected.
+            check: Verify checksums. Turn off only for diagnostics.
+
+        Returns:
+            The decoded words as a list of ints.
+
+        Raises:
+            ValueError: On the first checksum mismatch, naming the word index.
+        """
+        raw = self.read_raw(n_words * 3)
+        words = []
+        for i in range(n_words):
+            pair = raw[i * 3 : i * 3 + 2]
+            if check:
+                self.crc_verify(pair, raw[i * 3 + 2], "word {}".format(i))
+            words.append((pair[0] << 8) | pair[1])
+        return words

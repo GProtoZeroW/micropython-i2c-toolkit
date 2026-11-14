@@ -1,0 +1,161 @@
+"""``CRCMixin``: arbitrary-width CRC, parameterised entirely by class attributes.
+
+The parameters are datasheet facts about a part, so they live on the driver class the
+same way ``ALLOWED_ADDRS`` does. A module-level ``crc8(data, poly, init, ...)`` would
+push them to every call site, where they would drift.
+
+Reading the polynomial off a datasheet: drop the x^n term and set a bit per remaining
+power. x^8+x^2+x+1 -> ``0x07``; x^8+x^5+x^4+1 -> ``0x31``; x^16+x^15+x^2+1 -> ``0x8005``.
+
+``CRC_POLY`` deliberately has no default. A wrong polynomial yields checksums that
+verify against themselves and nothing else, so an unset one raises.
+
+What bytes a checksum covers is the *driver's* decision, not this class's. Sensirion
+parts checksum each 16-bit word; the TMAG5273 checksums the whole packet including the
+command byte the host sent.
+"""
+
+from micropython_i2c.bits import BitTools
+
+
+class CRCMixin(BitTools):
+    """Full parameterised CRC model: width, poly, init, reflect in/out, final XOR.
+
+    Class attributes:
+        CRC_WIDTH: Checksum width in bits (8 and 16 are usual).
+        CRC_POLY: Generator polynomial with the x^n term omitted. Must be set.
+        CRC_INIT: Starting accumulator value.
+        CRC_REFLECT_IN: Bit-reverse each input byte.
+        CRC_REFLECT_OUT: Bit-reverse the final accumulator.
+        CRC_XOR_OUT: XORed into the result last.
+        CRC_TABLE_ENABLE: Use a lazily built 256-entry table (~8x fewer ops per byte,
+            256 entries of RAM per parameter set). Worth it only on hot polling paths.
+    """
+
+    CRC_WIDTH = 8
+    CRC_POLY = None
+    CRC_INIT = 0xFF
+    CRC_REFLECT_IN = False
+    CRC_REFLECT_OUT = False
+    CRC_XOR_OUT = 0x00
+    CRC_TABLE_ENABLE = False
+
+    # Derived values are classmethods, not attributes, so they track a subclass that
+    # overrides CRC_WIDTH.
+
+    @classmethod
+    def crc_mask(cls):
+        """All-ones mask for ``CRC_WIDTH``."""
+        return (1 << cls.CRC_WIDTH) - 1
+
+    @classmethod
+    def crc_topbit(cls):
+        """The bit that shifts out of the accumulator and triggers the XOR."""
+        return 1 << (cls.CRC_WIDTH - 1)
+
+    @classmethod
+    def crc_check_configured(cls):
+        """Raise ``NotImplementedError`` naming the class if ``CRC_POLY`` is unset."""
+        if cls.CRC_POLY is None:
+            raise NotImplementedError(
+                "{}: CRC_POLY not set; declare the polynomial from the datasheet "
+                "(x^8+x^2+x+1 -> 0x07, x^8+x^5+x^4+1 -> 0x31)".format(cls.__name__)
+            )
+
+    @classmethod
+    def _crc_step8(cls, crc, mask, topbit):
+        """Run the eight shift/XOR steps for one byte already folded into ``crc``."""
+        poly = cls.CRC_POLY
+        for _ in range(8):
+            crc = ((crc << 1) ^ poly) & mask if crc & topbit else (crc << 1) & mask
+        return crc
+
+    @classmethod
+    def _crc_align(cls, byte):
+        """Align an input byte with the top of the accumulator."""
+        shift = cls.CRC_WIDTH - 8
+        return byte << shift if shift >= 0 else byte >> -shift
+
+    @classmethod
+    def crc_table(cls):
+        """Return the 256-entry lookup table, building it on first use.
+
+        Cached in ``cls.__dict__`` (not by inherited lookup) so a subclass that narrows
+        the parameters builds its own table instead of reusing its parent's.
+        """
+        cached = cls.__dict__.get("_crc_tbl")
+        if cached is not None:
+            return cached
+        cls.crc_check_configured()
+        mask, topbit = cls.crc_mask(), cls.crc_topbit()
+        table = [cls._crc_step8(cls._crc_align(b), mask, topbit) for b in range(256)]
+        cls._crc_tbl = table
+        return table
+
+    @classmethod
+    def crc_table_clear(cls):
+        """Drop this class's cached table; needed after changing a CRC parameter."""
+        if "_crc_tbl" in cls.__dict__:
+            del cls._crc_tbl
+
+    @classmethod
+    def crc(cls, data, init=None):
+        """Checksum over ``data`` using the class parameters.
+
+        Args:
+            data: Bytes to checksum.
+            init: Override the starting value, to resume a running checksum across
+                transfers. Reflection and final XOR apply at the end of every call, so
+                resuming only works with those at their identity values.
+
+        Returns:
+            The checksum, ``CRC_WIDTH`` bits wide.
+
+        Raises:
+            NotImplementedError: If ``CRC_POLY`` is unset.
+        """
+        cls.crc_check_configured()
+        mask, topbit = cls.crc_mask(), cls.crc_topbit()
+        shift = cls.CRC_WIDTH - 8
+        crc = cls.CRC_INIT if init is None else init
+        table = cls.crc_table() if cls.CRC_TABLE_ENABLE else None
+
+        for byte in data:
+            if cls.CRC_REFLECT_IN:
+                byte = cls.bit_reverse(byte, 8)
+            if table is None:
+                crc = cls._crc_step8(crc ^ cls._crc_align(byte), mask, topbit)
+            elif shift > 0:
+                # Index by top byte of the accumulator XOR input; shift the rest up.
+                crc = table[((crc >> shift) ^ byte) & 0xFF] ^ ((crc << 8) & mask)
+            else:
+                crc = table[(crc ^ byte) & 0xFF]
+
+        if cls.CRC_REFLECT_OUT:
+            crc = cls.bit_reverse(crc, cls.CRC_WIDTH)
+        return (crc ^ cls.CRC_XOR_OUT) & mask
+
+    @classmethod
+    def crc_ok(cls, data, expected, init=None):
+        """True if the checksum over ``data`` equals ``expected``.
+
+        Prefer ``crc_verify`` on a data path, where an unchecked boolean is a live risk.
+        """
+        return cls.crc(data, init=init) == expected
+
+    @classmethod
+    def crc_verify(cls, data, expected, context="", init=None):
+        """Return the checksum, or raise ``ValueError`` if it does not match ``expected``.
+
+        Raising rather than returning a flag is deliberate: a corrupted reading looks
+        exactly like a real one. ``context`` (a word index, a register name) is
+        prepended to the message.
+        """
+        actual = cls.crc(data, init=init)
+        if actual != expected:
+            raise ValueError(
+                "{}checksum fail: computed {:#04x}, received {:#04x}".format(
+                    context + ": " if context else "", actual, expected
+                )
+            )
+        return actual

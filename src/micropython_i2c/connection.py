@@ -1,0 +1,116 @@
+"""``I2CConnection``: one bound (bus, mux path, address) transport handle.
+
+The PyVISA-resource analogue. A connection pins down exactly which physical device is
+being talked to, and exposes the ``machine.I2C`` transfer methods with the address
+argument removed, so a driver holding one cannot address the wrong device.
+
+Mux paths are lists of ``[mux_addr, channel]`` hops, outermost first::
+
+    []                        # device sits directly on the bus
+    [[0x70, 3]]               # behind channel 3 of the mux at 0x70
+    [[0x70, 3], [0x71, 0]]    # ...then channel 0 of the mux at 0x71
+
+Every transfer takes the per-bus lock, replays the path, transfers and releases. The
+path is re-selected on *every* transfer because mux state is global to the bus and any
+other connection may have changed it; doing the selection inside the same critical
+section as the transfer is what makes the pair atomic.
+"""
+
+from micropython_i2c.compat import default_lock
+
+
+def path_select(bus, path):
+    """Write a one-hot channel mask to each mux on ``path``, outermost first.
+
+    Each write must land before the next, since a downstream mux only becomes
+    reachable once its upstream mux has switched. Call with the bus lock held.
+
+    Args:
+        bus: The ``machine.I2C`` object.
+        path: Resolved hops as ``[[mux_addr, channel], ...]``.
+    """
+    for mux_addr, channel in path:
+        bus.writeto(mux_addr, bytes([1 << channel]))
+
+
+def path_release(bus, path):
+    """Deselect every mux on ``path``, innermost first.
+
+    Order matters: deselecting the outer mux first would cut the inner mux off the
+    bus before it could be told to let go. Call with the bus lock held.
+    """
+    for mux_addr, _ in reversed(path):
+        bus.writeto(mux_addr, b"\x00")
+
+
+class I2CConnection:
+    """Locked, routed transport for one device. Mirrors ``machine.I2C`` minus ``addr``.
+
+    Args:
+        bus: The underlying ``machine.I2C``. Not hidden; ``conn.bus`` stays usable.
+        address: 7-bit device address, fixed for the life of the connection.
+        path: Resolved mux hops, outermost first. Empty or None for a bare-bus device.
+        lock: The per-bus mutex, shared by everything on the bus. If omitted a
+            private lock is created, which is only correct when this connection is the
+            sole user of the bus.
+
+    Attributes:
+        bus, addr, path, lock: The binding. Not meant to be mutated; build a new
+            connection instead.
+    """
+
+    def __init__(self, bus, address, path=None, lock=None):
+        self.bus = bus
+        self.addr = address
+        self.path = path or []
+        self.lock = lock or default_lock()
+
+    def __repr__(self):
+        hops = "".join(" via {:#04x}:{}".format(a, c) for a, c in self.path)
+        return "<I2CConnection {:#04x}{}>".format(self.addr, hops)
+
+    def path_select(self):
+        """Select this connection's mux path. Call with ``self.lock`` held."""
+        path_select(self.bus, self.path)
+
+    # Register-oriented transfers (write register number, repeated start, read).
+    # ``addrsize`` is the register-number width in bits, as in machine.I2C: 8 for most
+    # parts, 16 for parts such as the VL53L4CD.
+
+    def readfrom_mem(self, reg, nbytes, addrsize=8):
+        """Read ``nbytes`` from register ``reg``."""
+        with self.lock:
+            path_select(self.bus, self.path)
+            return self.bus.readfrom_mem(self.addr, reg, nbytes, addrsize=addrsize)
+
+    def readfrom_mem_into(self, reg, buf, addrsize=8):
+        """Read register ``reg`` into ``buf``; avoids an allocation in hot loops."""
+        with self.lock:
+            path_select(self.bus, self.path)
+            self.bus.readfrom_mem_into(self.addr, reg, buf, addrsize=addrsize)
+
+    def writeto_mem(self, reg, data, addrsize=8):
+        """Write ``data`` to register ``reg``."""
+        with self.lock:
+            path_select(self.bus, self.path)
+            self.bus.writeto_mem(self.addr, reg, data, addrsize=addrsize)
+
+    # Raw transfers, for command-driven parts with no register map.
+
+    def writeto(self, data):
+        """Write raw bytes. Returns the ACK count from the bus."""
+        with self.lock:
+            path_select(self.bus, self.path)
+            return self.bus.writeto(self.addr, data)
+
+    def readfrom(self, nbytes):
+        """Read ``nbytes`` of raw data."""
+        with self.lock:
+            path_select(self.bus, self.path)
+            return self.bus.readfrom(self.addr, nbytes)
+
+    def readfrom_into(self, buf):
+        """Read raw data into ``buf``."""
+        with self.lock:
+            path_select(self.bus, self.path)
+            self.bus.readfrom_into(self.addr, buf)

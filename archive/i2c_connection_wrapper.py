@@ -7,11 +7,11 @@
 #       extension: .py
 #       format_name: percent
 #       format_version: '1.3'
-#       jupytext_version: 1.19.1
+#       jupytext_version: 1.19.6
 #   kernelspec:
-#     display_name: MicroPython - USB
-#     language: micropython
-#     name: micropython
+#     display_name: MicroPython (micropylab)
+#     language: python
+#     name: micropylab
 # ---
 
 # %% [markdown]
@@ -90,8 +90,9 @@
 
 # %%
 # ruff: noqa
-# NOTE: run this cell first — connects the Jupyter MicroPython kernel to the board.
-%serialconnect --port=/dev/ttyACM1
+# NOTE: run this cell first. It connects the micropylab kernel to the board; with one USB board
+# it finds the port by itself. With several, give the port: %board connect /dev/ttyACM0
+# %board connect
 
 # %% [markdown]
 # # 1. Lock Mechanism
@@ -1736,11 +1737,12 @@ class CommandI2CBase(CRCMixin):
 # gets it wrong whenever the high byte happens to be zero, and a 16-bit register
 # reading `0x00A0` would print as one byte.
 #
-# ## A note on the Jupyter MicroPython kernel
+# ## A note on output
 #
-# `%serialconnect` executes each cell on the board and pipes stdout back. A bare
-# expression's repr is *not* stdout, so `dev.reg_read(0)` on its own line
-# displays nothing. Everything below prints explicitly.
+# Each cell runs on the board and its stdout streams back. With the micropylab
+# kernel a bare expression on the last line is also shown as `Out[n]` (like
+# IPython), but the cells below print explicitly so the output reads the same in
+# every MicroPython kernel.
 
 # %%
 def bin_bytes(v, nbytes=2):

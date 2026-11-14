@@ -1,0 +1,239 @@
+"""``RoutingTable``: the declarative bus topology, ingested and validated.
+
+Config format (JSON text or an equivalent dict)::
+
+    {
+      "buses": [0],
+      "muxes": {
+        "mux_a": {"bus": 0, "address": "0x71", "path": [], "driver": "TCA9548A",
+                  "reset_pin": 5}
+      },
+      "devices": [
+        {"name": "hall", "bus": 0, "address": "0x35", "path": [["mux_a", 3]],
+         "driver": "TMAG5273", "init_kwargs": {}}
+      ]
+    }
+
+A ``path`` is the full route, outermost hop first, naming muxes by their config name.
+A mux's own ``path`` is the route that reaches *it*. Addresses may be ints or "0x.."
+strings.
+
+``validate()`` collects every problem into one ``ConfigError`` rather than stopping at
+the first. Structural checks always run; driver-aware checks (driver exists, address
+legal for the part, channel within the mux's ``CHANNELS``) run when a registry
+``{driver name: class}`` is passed.
+"""
+
+import json
+
+
+class ConfigError(Exception):
+    """A routing table failed validation. ``problems`` lists every issue found."""
+
+    def __init__(self, problems):
+        self.problems = list(problems)
+        super().__init__("routing table invalid:\n  " + "\n  ".join(self.problems))
+
+
+def _parse_addr(value):
+    if isinstance(value, str):
+        return int(value, 16) if value.lower().startswith("0x") else int(value)
+    return value
+
+
+def _parse_path(path):
+    return [(hop[0], hop[1]) for hop in path or ()]
+
+
+class RoutingTable:
+    """Parsed topology. Build with ``loads()`` or ``from_dict()``, then ``validate()``.
+
+    Attributes:
+        buses: Declared bus ids.
+        muxes: ``{name: {"bus", "address", "path", "reset_pin", "driver"}}``.
+        devices: List of ``{"name", "bus", "address", "path", "driver", "init_kwargs"}``.
+    """
+
+    def __init__(self, buses, muxes, devices):
+        self.buses = buses
+        self.muxes = muxes
+        self.devices = devices
+
+    @classmethod
+    def loads(cls, raw):
+        """Build from JSON text, or from a dict."""
+        return cls.from_dict(raw if isinstance(raw, dict) else json.loads(raw))
+
+    @classmethod
+    def from_dict(cls, data):
+        """Build from a parsed config dict."""
+        muxes = {}
+        for name, m in data.get("muxes", {}).items():
+            muxes[name] = {
+                "bus": m["bus"],
+                "address": _parse_addr(m["address"]),
+                "path": _parse_path(m.get("path")),
+                "reset_pin": m.get("reset_pin"),
+                "driver": m.get("driver"),
+            }
+        devices = []
+        for d in data.get("devices", []):
+            devices.append(
+                {
+                    "name": d["name"],
+                    "bus": d["bus"],
+                    "address": _parse_addr(d["address"]),
+                    "path": _parse_path(d.get("path")),
+                    "driver": d["driver"],
+                    "init_kwargs": d.get("init_kwargs", {}),
+                }
+            )
+        return cls(list(data.get("buses", [])), muxes, devices)
+
+    # Views used by the checks, the scanner and the manager.
+
+    def entries(self):
+        """Yield ``(label, entry)`` for every mux (labelled ``mux:<name>``) and device."""
+        for name, m in self.muxes.items():
+            yield "mux:" + name, m
+        for d in self.devices:
+            yield d["name"], d
+
+    def resolve_path(self, path):
+        """Turn ``[(mux_name, ch), ...]`` into ``[[mux_addr, ch], ...]``."""
+        return [[self.muxes[name]["address"], ch] for name, ch in path]
+
+    def segments(self):
+        """``{(bus, path_tuple): [(address, label), ...]}`` for every entry."""
+        segs = {}
+        for label, e in self.entries():
+            segs.setdefault((e["bus"], tuple(e["path"])), []).append((e["address"], label))
+        return segs
+
+    # Structural checks. Each appends to ``problems``.
+
+    def _check_mux_refs(self, problems):
+        ok = True
+        for label, e in self.entries():
+            for name, _ in e["path"]:
+                if name not in self.muxes:
+                    problems.append("{}: path references unknown mux {!r}".format(label, name))
+                    ok = False
+        return ok
+
+    def _check_buses_declared(self, problems):
+        for label, e in self.entries():
+            if e["bus"] not in self.buses:
+                problems.append(
+                    "{}: bus {} not in declared buses {}".format(label, e["bus"], self.buses)
+                )
+
+    def _check_names_unique(self, problems):
+        counts = {}
+        for d in self.devices:
+            counts[d["name"]] = counts.get(d["name"], 0) + 1
+        for name, n in counts.items():
+            if n > 1:
+                problems.append("duplicate device name {!r} ({} entries)".format(name, n))
+            if name in self.muxes:
+                problems.append("name {!r} used by both a device and a mux".format(name))
+
+    def _check_channels_nonnegative(self, problems):
+        for label, e in self.entries():
+            for name, ch in e["path"]:
+                if not isinstance(ch, int) or ch < 0:
+                    problems.append("{}: bad channel {!r} on mux {!r}".format(label, ch, name))
+
+    def _check_path_consistency(self, problems):
+        """Every hop's mux must sit on the same bus, reached by exactly the preceding hops.
+
+        This also rules out cycles and a mux appearing twice in one path, since a mux
+        cannot be reached by two different prefixes.
+        """
+        ok = True
+        for label, e in self.entries():
+            for i, (name, _) in enumerate(e["path"]):
+                m = self.muxes[name]
+                if m["bus"] != e["bus"]:
+                    problems.append(
+                        "{}: on bus {} but its path enters mux {!r} on bus {}".format(
+                            label, e["bus"], name, m["bus"]
+                        )
+                    )
+                    ok = False
+                if m["path"] != e["path"][:i]:
+                    problems.append(
+                        "{}: hop {} goes through mux {!r} via {} but that mux is "
+                        "declared at {}".format(label, i, name, e["path"][:i], m["path"])
+                    )
+                    ok = False
+        return ok
+
+    def _check_addr_collisions(self, problems):
+        """Two entries collide if both are visible when one segment is selected.
+
+        Selecting a path leaves every upstream segment connected, so a segment sees its
+        own members plus those of every prefix of its path.
+        """
+        segs = self.segments()
+        reported = set()
+        for (bus, path), _ in segs.items():
+            by_addr = {}
+            for i in range(len(path) + 1):
+                for addr, label in segs.get((bus, path[:i]), ()):
+                    by_addr.setdefault(addr, []).append(label)
+            for addr, labels in by_addr.items():
+                key = (bus, addr, tuple(sorted(labels)))
+                if len(labels) > 1 and key not in reported:
+                    reported.add(key)
+                    problems.append(
+                        "address collision on bus {} at {:#04x}: {}".format(
+                            bus, addr, ", ".join(labels)
+                        )
+                    )
+
+    # Driver-aware checks.
+
+    def _check_drivers(self, problems, registry):
+        for label, e in self.entries():
+            drv = e.get("driver")
+            if drv is None:
+                problems.append("{}: no driver given".format(label))
+                continue
+            cls = registry.get(drv)
+            if cls is None:
+                problems.append("{}: driver {!r} not in registry".format(label, drv))
+            elif not cls.addr_ok(e["address"]):
+                problems.append(
+                    "{}: address {:#04x} not valid for {} (allowed {})".format(
+                        label, e["address"], drv, [hex(a) for a in cls.ALLOWED_ADDRS]
+                    )
+                )
+
+    def _check_channels_vs_class(self, problems, registry):
+        for label, e in self.entries():
+            for name, ch in e["path"]:
+                cls = registry.get(self.muxes[name].get("driver"))
+                if cls is not None and isinstance(ch, int) and not ch < cls.CHANNELS:
+                    problems.append(
+                        "{}: channel {} out of range 0..{} for mux {!r} ({})".format(
+                            label, ch, cls.CHANNELS - 1, name, cls.__name__
+                        )
+                    )
+
+    def validate(self, registry=None):
+        """Run every check; raise ``ConfigError`` listing all problems. Returns ``self``."""
+        problems = []
+        refs_ok = self._check_mux_refs(problems)
+        self._check_buses_declared(problems)
+        self._check_names_unique(problems)
+        self._check_channels_nonnegative(problems)
+        if refs_ok and self._check_path_consistency(problems):
+            self._check_addr_collisions(problems)
+        if registry is not None:
+            self._check_drivers(problems, registry)
+            if refs_ok:
+                self._check_channels_vs_class(problems, registry)
+        if problems:
+            raise ConfigError(problems)
+        return self

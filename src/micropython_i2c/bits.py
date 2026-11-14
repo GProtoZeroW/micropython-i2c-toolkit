@@ -1,0 +1,70 @@
+"""``BitTools``: stateless bit and byte helpers.
+
+Sign extension, mask construction and byte assembly get reimplemented in every driver,
+each time slightly differently. One implementation means one place to fix.
+
+They are staticmethods on a class rather than module functions so a driver reads as
+``self.sign_extend(word, 12)`` next to ``self.reg_read(...)``, and so a part with an
+odd format can override one for itself. ``BitTools`` has no class attributes, so mixing
+it in adds no obligations; ``RegisterI2CBase`` and ``CRCMixin`` both inherit it.
+
+Bitfields are ``(shift, width)`` tuples, declared once as class constants on a driver.
+"""
+
+
+class BitTools:
+    """Pure bit/byte arithmetic. Safe to call unbound: ``BitTools.sign_extend(...)``."""
+
+    @staticmethod
+    def sign_extend(value, bits):
+        """Interpret ``value`` as a ``bits``-wide two's-complement number.
+
+        ``value`` is masked to width first. On a left-justified part, shift the padding
+        out *before* calling this: extending the unshifted word treats the padding
+        zeros as magnitude.
+        """
+        value &= (1 << bits) - 1
+        return value - (1 << bits) if value & (1 << (bits - 1)) else value
+
+    @staticmethod
+    def field_mask(field):
+        """Aligned bitmask for a ``(shift, width)`` field."""
+        shift, width = field
+        return ((1 << width) - 1) << shift
+
+    @staticmethod
+    def field_extract(value, field):
+        """Pull a ``(shift, width)`` field out of a word already in hand."""
+        shift, width = field
+        return (value >> shift) & ((1 << width) - 1)
+
+    @staticmethod
+    def field_insert(value, field, new):
+        """Return ``value`` with a field replaced by ``new`` (masked to the field width)."""
+        shift, width = field
+        mask = ((1 << width) - 1) << shift
+        return (value & ~mask) | ((new << shift) & mask)
+
+    @staticmethod
+    def bit_reverse(value, bits=8):
+        """Reverse the bit order of a ``bits``-wide value (reflected CRCs, LSB-first parts)."""
+        out = 0
+        for _ in range(bits):
+            out = (out << 1) | (value & 1)
+            value >>= 1
+        return out
+
+    @staticmethod
+    def bytes_to_int(data, big_endian=True):
+        """Assemble bytes into an unsigned int, MSB first unless ``big_endian`` is False."""
+        return int.from_bytes(data, "big" if big_endian else "little")
+
+    @staticmethod
+    def int_to_bytes(value, nbytes, big_endian=True):
+        """Split ``value`` into ``nbytes`` bytes, masking to width first.
+
+        Masking rather than raising means an oversized argument is truncated instead of
+        producing a wrong-length transfer.
+        """
+        value &= (1 << (8 * nbytes)) - 1
+        return value.to_bytes(nbytes, "big" if big_endian else "little")

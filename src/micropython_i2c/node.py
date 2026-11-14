@@ -1,0 +1,161 @@
+"""The node tree: ``I2CNode`` -> {``I2CDevice``, ``I2CMux``}.
+
+``I2CNode`` holds two contracts:
+
+* **Datasheet facts** as class attributes (``ALLOWED_ADDRS``, ``BAUD_*``), so config
+  validation and scan matching can reason about a part before any instance exists.
+* **Transport**: four methods (``read_mem``, ``write_mem``, ``read_raw``,
+  ``write_raw``). The protocol mixins in ``protocol.py`` call only these, never
+  ``self.conn`` or a bus, which is what lets the same mixin serve a sensor behind three
+  muxes and a mux on the bare bus.
+
+Both node types reach the hardware through an ``I2CConnection``. A device is handed one
+by the manager. A mux builds its own from its *upstream* path (the hops that reach the
+mux itself), so it never routes through itself.
+"""
+
+from micropython_i2c.compat import sleep_us
+from micropython_i2c.connection import I2CConnection
+
+
+class I2CNode:
+    """Common ancestor for anything addressable on an I2C bus.
+
+    Class attributes (override from the datasheet):
+        ALLOWED_ADDRS: Every 7-bit address the part can be strapped to.
+        BAUD_NOMINAL: Normal operating speed.
+        BAUD_MAX: Datasheet ceiling. A shared bus runs at or below the lowest one.
+        BAUD_MIN: Datasheet floor. Some parts time out if clocked too slowly.
+        REG_ADDR_BITS: Width of a register number on the wire: 8, or 16 for parts with
+            a 16-bit register map (VL53L4CD).
+
+    Attributes:
+        conn: The ``I2CConnection`` used for every transfer.
+        kwargs: Extra keyword arguments from the config entry (labels, calibration
+            hints), kept rather than rejected so the base needs to know nothing of them.
+    """
+
+    ALLOWED_ADDRS = ()
+    BAUD_NOMINAL = 100_000
+    BAUD_MAX = 400_000
+    BAUD_MIN = 10_000
+    REG_ADDR_BITS = 8
+
+    def __init__(self, conn, **kwargs):
+        self.conn = conn
+        self.kwargs = kwargs
+
+    def __repr__(self):
+        return "<{} {!r}>".format(type(self).__name__, self.conn)
+
+    @classmethod
+    def addr_ok(cls, addr):
+        """True if ``addr`` is one this part can answer on. No instance needed."""
+        return addr in cls.ALLOWED_ADDRS
+
+    @classmethod
+    def baud_ok(cls, freq):
+        """True if ``freq`` is inside this part's datasheet limits."""
+        return cls.BAUD_MIN <= freq <= cls.BAUD_MAX
+
+    @property
+    def addr(self):
+        """This node's 7-bit address (from the connection)."""
+        return self.conn.addr
+
+    # Transport contract. Protocol mixins are written against exactly these four.
+
+    def read_mem(self, reg, nbytes):
+        """Read ``nbytes`` from register ``reg``."""
+        return self.conn.readfrom_mem(reg, nbytes, self.REG_ADDR_BITS)
+
+    def write_mem(self, reg, data):
+        """Write ``data`` to register ``reg``."""
+        self.conn.writeto_mem(reg, data, self.REG_ADDR_BITS)
+
+    def read_raw(self, nbytes):
+        """Read ``nbytes`` with no register phase."""
+        return self.conn.readfrom(nbytes)
+
+    def write_raw(self, data):
+        """Write raw bytes with no register phase."""
+        self.conn.writeto(data)
+
+
+class I2CDevice(I2CNode):
+    """A routed device, reached through a connection the manager built for it.
+
+    The base class for ordinary drivers: subclass it alongside a protocol mixin,
+    override the datasheet attributes and add device methods::
+
+        class MySensor(RegisterI2CBase, I2CDevice):
+            ALLOWED_ADDRS = (0x48, 0x49)
+
+    Args:
+        conn: A fully bound ``I2CConnection`` to this device.
+        **kwargs: Kept on ``self.kwargs``.
+    """
+
+
+class I2CMux(I2CNode):
+    """A routing element. Talks to the bus at its own address via its upstream path.
+
+    Subclasses implement the mux API the manager relies on (``channel_select``,
+    ``channel_deselect``, ``control_read``), since channel encoding is part-specific.
+
+    Args:
+        bus: The ``machine.I2C`` object.
+        address: The mux's own 7-bit address.
+        lock: The per-bus mutex shared with every connection on the bus. Must be the
+            shared one: a mux locking independently could re-route the bus mid-transfer.
+        path: Hops needed to reach *this* mux, for chained muxes. Empty for a mux wired
+            straight to the bus.
+        reset_pin: Pin id of the active-low RESET line, if wired.
+        **kwargs: Kept on ``self.kwargs``.
+
+    Class attributes:
+        CHANNELS: Downstream channel count; the routing table bounds-checks against it.
+    """
+
+    CHANNELS = 0
+
+    def __init__(self, bus, address, lock=None, path=None, reset_pin=None, **kwargs):
+        super().__init__(I2CConnection(bus, address, path, lock), **kwargs)
+        self.reset_pin = None
+        if reset_pin is not None:
+            # Lazy import keeps this module importable off-target (host tests, lint).
+            from machine import Pin
+
+            self.reset_pin = Pin(reset_pin, Pin.OUT, value=1)  # active low: idle high
+
+    def channel_check(self, channel):
+        """Raise ``ValueError`` unless ``channel`` is in ``0..CHANNELS-1``."""
+        if not 0 <= channel < self.CHANNELS:
+            raise ValueError("channel {} out of range 0..{}".format(channel, self.CHANNELS - 1))
+
+    def channel_select(self, channel):
+        """Route the mux to ``channel``, deselecting any others."""
+        raise NotImplementedError
+
+    def channel_deselect(self):
+        """Disconnect every channel, isolating everything downstream."""
+        raise NotImplementedError
+
+    def control_read(self):
+        """Read back the current channel selection."""
+        raise NotImplementedError
+
+    def reset(self):
+        """Pulse the RESET pin. Returns False if no pin was wired.
+
+        The recovery of last resort: a downstream part holding SDA low wedges the
+        segment and cannot be talked out of it. Resetting the mux drops every channel
+        and cuts it off. The 10 us dwells are comfortably over TCA9548A-class minimums.
+        """
+        if self.reset_pin is None:
+            return False
+        self.reset_pin.value(0)
+        sleep_us(10)
+        self.reset_pin.value(1)
+        sleep_us(10)
+        return True

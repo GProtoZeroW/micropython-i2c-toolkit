@@ -6,17 +6,18 @@
 #       extension: .py
 #       format_name: percent
 #       format_version: '1.3'
-#       jupytext_version: 1.19.1
+#       jupytext_version: 1.19.6
 #   kernelspec:
-#     display_name: MicroPython
+#     display_name: MicroPython (micropylab)
 #     language: python
-#     name: micropython
+#     name: micropylab
 # ---
 
 # %%
 # ruff: noqa
-# NOTE: run this cell first — connects the Jupyter MicroPython kernel to the board.
-# %serialconnect --port=/dev/ttyACM0
+# NOTE: run this cell first. It connects the micropylab kernel to the board; with one USB board
+# it finds the port by itself. With several, give the port: %board connect /dev/ttyACM0
+# %board connect
 
 # %% [markdown]
 # # I2C Routing Harness — full run flow

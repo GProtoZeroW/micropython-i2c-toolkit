@@ -5,3 +5,17 @@
 
 # Python / uv virtual environment
 .venv/
+
+# micropylab: stubs, package manifests, saved board files
+.micropylab/
+board_files/
+
+# Python
+__pycache__/
+*.mpy
+.pytest_cache/
+.ruff_cache/
+
+# JupyterLab per-project state (collaboration store, workspace settings)
+.jupyter/
+.jupyter_ystore.db
