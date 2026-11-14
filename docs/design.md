@@ -142,7 +142,7 @@ init-time identity reads run on a safe clock.
   `CMD_BYTES`/`CRC_*`).
 * Put datasheet facts in a `<Part>Regs` class with no methods and derive the driver from
   it. Bring-up can then drive the mixin directly against the part before driver logic
-  exists to confuse the diagnosis (see notebook 01).
+  exists to confuse the diagnosis (see `dev_notebooks/drivers_tmp102_devNB`).
 * Declare fields as `(shift, width)` tuples and coded fields as `{code: value}` dicts.
   Never open-code a shift; use `field_extract` / `field_insert`.
 * Use `sign_extend`, and strip padding *before* calling it.

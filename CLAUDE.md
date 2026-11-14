@@ -38,7 +38,8 @@ PyVISA-style I2C connection layer, drivers and mux-aware routing for MicroPython
   `# Hardware validation` section connects, uploads `src/micropython_i2c` with
   `%files copy -r`, runs the hardware checks on the board and ends with `%board disconnect`.
 - Plain notebooks (`notebooks/`) are whole-bench hardware checks, not module sources.
-- `archive/` holds the original single-file notebooks, for reference only.
+- `archive/` holds the original single-file notebooks and the old bring-up notebooks (replaced by
+  the dev notebooks), for reference only.
 
 ## Working rules
 - Board code runs on MicroPython: no type hints, no f-strings in `src/` (use `str.format`),

@@ -34,28 +34,32 @@ src/micropython_i2c/      board-side package (copied to /lib/micropython_i2c)
   drivers/                TMP102, TMAG5273, SHTC3, TCA9548A, VL53L4CD, QwiicRelay
                           + lazy registry
 tests/                    host-side pytest: codecs, CRC vectors, routing, fake-bus drivers
-notebooks/                hardware bring-up (jupytext .py is the source of truth)
-  01_tmp102_bringup       RegisterI2CBase through TMP102Regs (behind the mux), then the driver
-  02_tmag5273_bringup     both mixins, CRC against silicon, fast reads, ranges
+dev_notebooks/            module sources: each writes a module and its tests, runs them on the
+                          host, then checks the real part (jupytext .py is the source of truth)
+  drivers_tmp102_devNB    drivers/tmp102.py
+  drivers_tca9548a_devNB  drivers/tca9548a.py
+  drivers_tmag5273_devNB  drivers/tmag5273.py
+notebooks/                whole-bench hardware checks
   03_routing_harness      the whole bench: config -> validate -> scan -> build -> talk
 docs/design.md            why each layer is the way it is; limits and next steps
 docs/datasheets/          part datasheets
-archive/                  the original single-file notebooks, for reference
+archive/                  the original single-file notebooks and the old bring-up notebooks
 ```
 
 ## The bench
 
 ```
 I2C 0 (STEMMA QT, scl=9 sda=8)
-  SparkFun Qwiic Mux (TCA9548A) @ 0x71   (jumpered: 0x70 is the SHTC3's only address)
-    ch 0: SHTC3    @ 0x70
-    ch 2: TMP102   @ 0x48
-I2C 1 (pins unconfirmed; notebook 03 section 2 finds them)
   VL53L4CD           @ 0x29
   Qwiic Single Relay @ 0x18
+I2C 1 (scl=15 sda=16)
+  SparkFun Qwiic Mux (TCA9548A) @ 0x70   (address jumpers open)
+    ch 0: SparkFun TMAG5273 (B1) @ 0x22
+    ch 2: TMP102                 @ 0x48
 ```
 
-The TMAG5273 notebook (02) is for when that board is connected; it is not on this bench.
+Found by the dev notebooks' hardware sections (2026-11-13). The SHTC3 is off the bench: it is
+always at 0x70, the mux's own address.
 
 ## Setup
 
