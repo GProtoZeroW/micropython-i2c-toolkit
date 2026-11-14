@@ -30,6 +30,25 @@
 # with a matching test for every unit test above, then disconnects.
 
 # %% [markdown]
+# # Hardware and configuration
+# What this notebook was validated with. The same table opens `# Hardware validation`.
+#
+# | | Host run (simulation) | Hardware run |
+# |---|---|---|
+# | **Runs on** | CPython 3.13.15 in the micropylab kernel (1.0.0a1), no board | Unexpected Maker FeatherS3 (ESP32-S3), MicroPython 1.28.0 (v1.28.0, 2026-04-06), USB `/dev/ttyACM0` |
+# | **I2C bus** | `FakeBus` | `machine.I2C(0)`, **bus 0**, the STEMMA QT connector (scl=9 sda=8, on-board pull-ups), 100 kHz (`bus_open("feathers3", 0)`) |
+# | **Mux** | none | **none**: the SHTC3 is always at `0x70`, the mux's own address |
+# | **Sensor** | `FakeSHTC3` at `0x70`: idle (as after power-up), 25 C, 50 %RH, ID `0x0807`, measures in 11.0 ms (normal) / 0.5 ms (low power) | SparkFun Qwiic SHTC3 at `0x70` |
+# | **Other parts used** | none | none: the SHTC3 was the only part connected to the board. The TMP102 cross-check (bus 1, mux channel 2) was skipped in this run; an earlier run with it connected read 23.43 C against 22.88 C |
+# | **Datasheet** | Sensirion SHTC3, version 4, December 2022 | same |
+# | **Result** | 15 unit tests pass | 35 of 35 hardware checks passed (2026-11-14) |
+#
+# The simulation and the bench differ on purpose here: a mux in front of the SHTC3 would have been
+# the better test, but the bench's mux has the same address (`0x70`), so the SHTC3 sits alone on bus
+# 0. The fake also refuses wake-up for 2 ms after a NACK (the real part: under 1 ms) so a test can
+# see it at ms resolution.
+
+# %% [markdown]
 # # TODO:
 # Nothing open.
 #
@@ -742,9 +761,22 @@ def test_soft_reset_leaves_it_asleep():
 # > - Each cell puts the SHTC3 back to sleep when it finishes, even if it fails.
 # > - The section ends with `%board disconnect`. If you stop partway, run that cell yourself.
 #
-# Hardware (2026-11-14): FeatherS3 and a SparkFun Qwiic SHTC3 (`0x70`) on **I2C bus 0** (STEMMA
-# QT, scl=9 sda=8), alone on the bus, no mux. The temperature cross-check uses the TMP102 (`0x48`,
-# mux channel 2 on bus 1) when it is connected, and is skipped when it is not.
+# **Hardware and configuration** (same as the table at the top):
+#
+# | | Host run (simulation) | Hardware run |
+# |---|---|---|
+# | **Runs on** | CPython 3.13.15 in the micropylab kernel (1.0.0a1), no board | Unexpected Maker FeatherS3 (ESP32-S3), MicroPython 1.28.0 (v1.28.0, 2026-04-06), USB `/dev/ttyACM0` |
+# | **I2C bus** | `FakeBus` | `machine.I2C(0)`, **bus 0**, the STEMMA QT connector (scl=9 sda=8, on-board pull-ups), 100 kHz (`bus_open("feathers3", 0)`) |
+# | **Mux** | none | **none**: the SHTC3 is always at `0x70`, the mux's own address |
+# | **Sensor** | `FakeSHTC3` at `0x70`: idle (as after power-up), 25 C, 50 %RH, ID `0x0807`, measures in 11.0 ms (normal) / 0.5 ms (low power) | SparkFun Qwiic SHTC3 at `0x70` |
+# | **Other parts used** | none | none: the SHTC3 was the only part connected to the board. The TMP102 cross-check (bus 1, mux channel 2) was skipped in this run; an earlier run with it connected read 23.43 C against 22.88 C |
+# | **Datasheet** | Sensirion SHTC3, version 4, December 2022 | same |
+# | **Result** | 15 unit tests pass | 35 of 35 hardware checks passed (2026-11-14) |
+#
+# The simulation and the bench differ on purpose here: a mux in front of the SHTC3 would have been
+# the better test, but the bench's mux has the same address (`0x70`), so the SHTC3 sits alone on bus
+# 0. The fake also refuses wake-up for 2 ms after a NACK (the real part: under 1 ms) so a test can
+# see it at ms resolution.
 #
 # Layout: connect and set up, find the part, then **matching tests** (one per unit test above,
 # same name, run on the real part and on MicroPython), hardware-only checks, **diagnostics**

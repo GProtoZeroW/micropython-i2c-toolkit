@@ -31,6 +31,23 @@
 # TMAG5273 behind the mux with a matching test for every unit test above, then disconnects.
 
 # %% [markdown]
+# # Hardware and configuration
+# What this notebook was validated with. The same table opens `# Hardware validation`.
+#
+# | | Host run (simulation) | Hardware run |
+# |---|---|---|
+# | **Runs on** | CPython 3.13.15 in the micropylab kernel (1.0.0a1), no board | Unexpected Maker FeatherS3 (ESP32-S3), MicroPython 1.28.0 (v1.28.0, 2026-04-06), USB `/dev/ttyACM0` |
+# | **I2C bus** | `FakeBus` | `machine.I2C(1)`, **bus 1**, scl=15 sda=16, 100 kHz (`bus_open("feathers3", 1)`) |
+# | **Mux** | `FakeMux` at `0x70`, channel 0, only in tests that ask for it (`mux=True`); the rest talk to the part directly | SparkFun Qwiic Mux (TCA9548A) at `0x70` (address jumpers open), **channel 0** |
+# | **Sensor** | `FakeTMAG5273`: a B1 at `0x22`, power-on state, field (5, -5, 0) mT, 25 C | SparkFun Qwiic TMAG5273, a **B1** (TMAG5273B1) at `0x22` |
+# | **Other parts used** | none | TMP102 at `0x48` on mux channel 2: the reference for the temperature check |
+# | **Datasheet** | TI SLYS045C (rev C, April 2026) | same |
+# | **Result** | 36 unit tests pass | 79 of 79 hardware checks passed (2026-11-14) |
+#
+# Nothing else on bus 1 is touched. Bus 0 is not used by this notebook. To rerun the hardware
+# section, wire the bench this way again (README "The bench").
+
+# %% [markdown]
 # # TODO:
 # Nothing open.
 #
@@ -1902,10 +1919,20 @@ def test_reset_flag_recovers_a_part_left_in_fast_mode():
 # >   it fails.
 # > - The section ends with `%board disconnect`. If you stop partway, run that cell yourself.
 #
-# Hardware (as found by `drivers_tca9548a_devNB`, 2026-11-13): FeatherS3, SparkFun Qwiic Mux
-# (TCA9548A) at `0x70` on **bus 1** (scl=15, sda=16), SparkFun Qwiic TMAG5273 (a **B1**, `0x22`)
-# on mux **channel 0**, TMP102 (`0x48`) on channel 2. The temperature check reads the TMP102
-# too.
+# **Hardware and configuration** (same as the table at the top):
+#
+# | | Host run (simulation) | Hardware run |
+# |---|---|---|
+# | **Runs on** | CPython 3.13.15 in the micropylab kernel (1.0.0a1), no board | Unexpected Maker FeatherS3 (ESP32-S3), MicroPython 1.28.0 (v1.28.0, 2026-04-06), USB `/dev/ttyACM0` |
+# | **I2C bus** | `FakeBus` | `machine.I2C(1)`, **bus 1**, scl=15 sda=16, 100 kHz (`bus_open("feathers3", 1)`) |
+# | **Mux** | `FakeMux` at `0x70`, channel 0, only in tests that ask for it (`mux=True`); the rest talk to the part directly | SparkFun Qwiic Mux (TCA9548A) at `0x70` (address jumpers open), **channel 0** |
+# | **Sensor** | `FakeTMAG5273`: a B1 at `0x22`, power-on state, field (5, -5, 0) mT, 25 C | SparkFun Qwiic TMAG5273, a **B1** (TMAG5273B1) at `0x22` |
+# | **Other parts used** | none | TMP102 at `0x48` on mux channel 2: the reference for the temperature check |
+# | **Datasheet** | TI SLYS045C (rev C, April 2026) | same |
+# | **Result** | 36 unit tests pass | 79 of 79 hardware checks passed (2026-11-14) |
+#
+# Nothing else on bus 1 is touched. Bus 0 is not used by this notebook. To rerun the hardware
+# section, wire the bench this way again (README "The bench").
 #
 # Layout: connect and set up, the mux, identification, then **matching tests** (one per unit test
 # above, same name, run on the real part and on MicroPython), hardware-only checks,
