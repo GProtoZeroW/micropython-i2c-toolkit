@@ -28,6 +28,25 @@
 # `%%extract` built in, so there is no `%load_ext jupyter_lab_extractor` cell.
 
 # %% [markdown]
+# # Hardware and configuration
+# What this notebook was validated with. The same table opens `# Hardware validation`.
+#
+# | | Host run (simulation) | Hardware run |
+# |---|---|---|
+# | **Runs on** | CPython 3.13.15 in the micropylab kernel (1.0.0a1), no board | Unexpected Maker FeatherS3 (ESP32-S3), MicroPython 1.28.0 (v1.28.0, 2026-04-06), USB `/dev/ttyACM0` |
+# | **I2C bus** | `FakeBus` | both buses scanned to find the mux: bus 0 (STEMMA QT, scl=9 sda=8) and `machine.I2C(1)`, **bus 1**, scl=15 sda=16, 100 kHz (`bus_open("feathers3", 1)`); the checks run on bus 1 |
+# | **Mux** | `FakeMux` at `0x71` by default (tests also build it at other addresses) | SparkFun Qwiic Mux (TCA9548A) at `0x70` (address jumpers open) |
+# | **Behind the mux** | `FakeRegisterPart` at `0x70` on channel 0 (an SHTC3-like part at the mux's own address) and one at `0x48` on channel 2 | channel 0: SparkFun TMAG5273 (B1) at `0x22`; channel 2: TMP102 at `0x48`; channels 1, 3-7 empty (the `BENCH` cell) |
+# | **Other parts used** | none | seen by the scan, not used: VL53L4CD (`0x29`) and Qwiic Single Relay (`0x18`) on bus 0 |
+# | **Datasheet** | TI TCA9548A (no copy in `docs/datasheets/`) | same |
+# | **Result** | 8 unit tests pass | 23 of 23 hardware checks passed (2026-11-13) |
+#
+# The simulation and the bench differ on purpose: the fake mux sits at `0x71` with a part at `0x70`
+# behind it, to test the clash a part at the mux's address causes; on the bench the mux is at `0x70`
+# and nothing behind it shares that address. To rerun the hardware section, wire the bench this way
+# again (README "The bench").
+
+# %% [markdown]
 # # TODO:
 # Nothing
 #
@@ -468,9 +487,22 @@ def test_datasheet_facts():
 # matching test for every unit test above. What is wired behind each channel is written down
 # once, in the `BENCH` cell; every check reads it from there.
 #
-# Bench as of 2026-11-13 (found by the first run): SparkFun Qwiic Mux at `0x70` (address jumpers
-# open) on **bus 1** (scl=15, sda=16), TMAG5273 on channel 0, TMP102 (`0x48`) on channel 2. The
-# VL53L4CD and the relay are on bus 0 (the STEMMA QT port).
+# **Hardware and configuration** (same as the table at the top):
+#
+# | | Host run (simulation) | Hardware run |
+# |---|---|---|
+# | **Runs on** | CPython 3.13.15 in the micropylab kernel (1.0.0a1), no board | Unexpected Maker FeatherS3 (ESP32-S3), MicroPython 1.28.0 (v1.28.0, 2026-04-06), USB `/dev/ttyACM0` |
+# | **I2C bus** | `FakeBus` | both buses scanned to find the mux: bus 0 (STEMMA QT, scl=9 sda=8) and `machine.I2C(1)`, **bus 1**, scl=15 sda=16, 100 kHz (`bus_open("feathers3", 1)`); the checks run on bus 1 |
+# | **Mux** | `FakeMux` at `0x71` by default (tests also build it at other addresses) | SparkFun Qwiic Mux (TCA9548A) at `0x70` (address jumpers open) |
+# | **Behind the mux** | `FakeRegisterPart` at `0x70` on channel 0 (an SHTC3-like part at the mux's own address) and one at `0x48` on channel 2 | channel 0: SparkFun TMAG5273 (B1) at `0x22`; channel 2: TMP102 at `0x48`; channels 1, 3-7 empty (the `BENCH` cell) |
+# | **Other parts used** | none | seen by the scan, not used: VL53L4CD (`0x29`) and Qwiic Single Relay (`0x18`) on bus 0 |
+# | **Datasheet** | TI TCA9548A (no copy in `docs/datasheets/`) | same |
+# | **Result** | 8 unit tests pass | 23 of 23 hardware checks passed (2026-11-13) |
+#
+# The simulation and the bench differ on purpose: the fake mux sits at `0x71` with a part at `0x70`
+# behind it, to test the clash a part at the mux's address causes; on the bench the mux is at `0x70`
+# and nothing behind it shares that address. To rerun the hardware section, wire the bench this way
+# again (README "The bench").
 
 # %% [markdown]
 # ## Connect and set up

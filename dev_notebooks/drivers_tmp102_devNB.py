@@ -34,6 +34,24 @@
 # micropylab has `%%extract` built in, so there is no `%load_ext jupyter_lab_extractor` cell.
 
 # %% [markdown]
+# # Hardware and configuration
+# What this notebook was validated with. The same table opens `# Hardware validation`.
+#
+# | | Host run (simulation) | Hardware run |
+# |---|---|---|
+# | **Runs on** | CPython 3.13.15 in the micropylab kernel (1.0.0a1), no board | Unexpected Maker FeatherS3 (ESP32-S3), MicroPython 1.28.0 (v1.28.0, 2026-04-06), USB `/dev/ttyACM0` |
+# | **I2C bus** | `FakeBus` | `machine.I2C(1)`, **bus 1**, scl=15 sda=16, 100 kHz (`bus_open("feathers3", 1)`) |
+# | **Mux** | none: the fake part is on the bus directly | SparkFun Qwiic Mux (TCA9548A) at `0x70` (address jumpers open), **channel 2** |
+# | **Sensor** | `FakeTMP102` at `0x48`, power-on state, 25 C (`0x1900`) | TMP102 at `0x48` (ADD0 to GND) |
+# | **Other parts used** | none | none; the TMAG5273 (`0x22`) sat on mux channel 0, off while the TMP102 was read |
+# | **Datasheet** | TI SBOS397I | same |
+# | **Result** | 16 unit tests pass | 51 of 51 hardware checks passed (2026-11-13) |
+#
+# The simulation leaves the mux out (the mux has its own notebook, `drivers_tca9548a_devNB`); the
+# hardware run reaches the TMP102 through it. Bus 0 is not used by this notebook. To rerun the
+# hardware section, wire the bench this way again (README "The bench").
+
+# %% [markdown]
 # # TODO:
 # Nothing
 #
@@ -964,10 +982,21 @@ def test_one_shot_needs_shutdown_mode():
 # > - Each cell puts the sensor back to its power-on state when it finishes, even if it fails.
 # > - The section ends with `%board disconnect`. If you stop partway, run that cell yourself.
 #
-# Hardware (as found by `drivers_tca9548a_devNB`, 2026-11-13): FeatherS3, SparkFun Qwiic Mux
-# (TCA9548A) at `0x70` (address jumpers open) on **bus 1** (scl=15, sda=16), TMP102 at `0x48` on
-# mux **channel 2**. The TMAG5273 (`0x22`) is on channel 0; nothing on the bench shares the mux's
-# address.
+# **Hardware and configuration** (same as the table at the top):
+#
+# | | Host run (simulation) | Hardware run |
+# |---|---|---|
+# | **Runs on** | CPython 3.13.15 in the micropylab kernel (1.0.0a1), no board | Unexpected Maker FeatherS3 (ESP32-S3), MicroPython 1.28.0 (v1.28.0, 2026-04-06), USB `/dev/ttyACM0` |
+# | **I2C bus** | `FakeBus` | `machine.I2C(1)`, **bus 1**, scl=15 sda=16, 100 kHz (`bus_open("feathers3", 1)`) |
+# | **Mux** | none: the fake part is on the bus directly | SparkFun Qwiic Mux (TCA9548A) at `0x70` (address jumpers open), **channel 2** |
+# | **Sensor** | `FakeTMP102` at `0x48`, power-on state, 25 C (`0x1900`) | TMP102 at `0x48` (ADD0 to GND) |
+# | **Other parts used** | none | none; the TMAG5273 (`0x22`) sat on mux channel 0, off while the TMP102 was read |
+# | **Datasheet** | TI SBOS397I | same |
+# | **Result** | 16 unit tests pass | 51 of 51 hardware checks passed (2026-11-13) |
+#
+# The simulation leaves the mux out (the mux has its own notebook, `drivers_tca9548a_devNB`); the
+# hardware run reaches the TMP102 through it. Bus 0 is not used by this notebook. To rerun the
+# hardware section, wire the bench this way again (README "The bench").
 #
 # Layout: connect and set up, then the mux and the layer stack, then **matching tests** (one per
 # unit test above, same name, run on the real part and on MicroPython), then hardware-only
