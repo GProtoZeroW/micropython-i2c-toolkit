@@ -125,6 +125,118 @@ class FakeSensirion:
         return out[:nbytes]
 
 
+def _crc8_31(data, crc=0xFF):
+    """CRC-8, polynomial 0x31, seeded 0xFF (Sensirion's)."""
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x31) & 0xFF if crc & 0x80 else (crc << 1) & 0xFF
+    return crc
+
+
+class FakeSHTC3:
+    """A Sensirion SHTC3, close enough to test a driver on the host (datasheet version 4).
+
+    * It starts **idle** (awake), as after power-up. In sleep it acknowledges only the wake-up
+      command; anything else raises ``OSError`` (a NACK), and for ``REFUSE_MS`` after that it
+      NACKs wake-up too.
+    * A measurement command starts a measurement of ``MEAS_MS`` (11 ms normal, 0.5 ms low
+      power). Until it ends every transfer is NACKed, except a read after a clock-stretching
+      command, which waits for the result.
+    * The read returns two words, each followed by its CRC: temperature first or humidity
+      first, as the command says. The result is gone after one read; a read with nothing
+      waiting is NACKed.
+    * ``CMD_READ_ID`` makes the next read return ``id_word``. Soft reset returns to idle. A
+      wake-up to a part that is already awake is acknowledged.
+
+    All of this was measured on a SparkFun SHTC3 (``drivers_shtc3_devNB`` diagnostics,
+    2026-11-14); the real refusal after a NACK lasts under 1 ms, the fake's ``REFUSE_MS`` is
+    longer so a test can see it at ms resolution. Set ``corrupt`` to the number of upcoming
+    reads to flip one bit in.
+    """
+
+    WAKEUP, SLEEP, SOFT_RESET, READ_ID = 0x3517, 0xB098, 0x805D, 0xEFC8
+    # opcode -> (low_power, rh_first, clock_stretch), Table 11
+    MEASURE = {
+        0x7CA2: (False, False, True), 0x5C24: (False, True, True),
+        0x7866: (False, False, False), 0x58E0: (False, True, False),
+        0x6458: (True, False, True), 0x44DE: (True, True, True),
+        0x609C: (True, False, False), 0x401A: (True, True, False),
+    }  # fmt: skip
+    MEAS_MS = {False: 11.0, True: 0.5}  # measured; the datasheet maximums are 12.1 and 0.8
+    REFUSE_MS = 2
+
+    def __init__(self, temp_c=25.0, rh=50.0, id_word=0x0807):
+        self.temp_c = temp_c
+        self.rh = rh
+        self.id_word = id_word
+        self.asleep = False
+        self.pending = None  # words the next read returns
+        self.stretch = False
+        self.busy_until = None  # ticks_ms when the measurement ends
+        self.refuse_until = None  # ticks_ms until which wake-up is NACKed
+        self.corrupt = 0
+        self.commands = []
+
+    def _busy(self):
+        if self.busy_until is not None and ticks_diff(self.busy_until, ticks_ms()) > 0:
+            return True
+        self.busy_until = None
+        return False
+
+    def _nack(self):
+        raise OSError(19, "ENODEV")
+
+    def raw_write(self, data):
+        cmd = int.from_bytes(bytes(data), "big")
+        if self.asleep and cmd != self.WAKEUP:
+            self.refuse_until = ticks_add(ticks_ms(), self.REFUSE_MS)
+            self._nack()
+        if self.refuse_until is not None:
+            if ticks_diff(self.refuse_until, ticks_ms()) > 0:
+                self._nack()
+            self.refuse_until = None
+        if self._busy():
+            self._nack()
+        self.commands.append(cmd)
+        if cmd == self.WAKEUP:
+            self.asleep = False
+        elif cmd == self.SLEEP:
+            self.asleep = True
+        elif cmd == self.SOFT_RESET:
+            self.pending = None
+        elif cmd == self.READ_ID:
+            self.pending, self.stretch = [self.id_word], False
+        elif cmd in self.MEASURE:
+            low_power, rh_first, self.stretch = self.MEASURE[cmd]
+            t = max(0, min(0xFFFF, int(round((self.temp_c + 45) * 65536 / 175))))
+            h = max(0, min(0xFFFF, int(round(self.rh * 65536 / 100))))
+            self.pending = [h, t] if rh_first else [t, h]
+            self.busy_until = ticks_add(ticks_ms(), int(self.MEAS_MS[low_power]))  # ms ticks
+        else:
+            self._nack()  # not a command
+
+    def raw_read(self, nbytes):
+        if self.asleep:
+            self._nack()
+        if self._busy():
+            if not self.stretch:
+                self._nack()
+            while self._busy():  # clock stretching: SCL held low until the result is ready
+                pass
+        if self.pending is None:
+            self._nack()  # nothing to read (assumed)
+        out = bytearray()
+        for w in self.pending:
+            pair = bytes([w >> 8, w & 0xFF])
+            out += pair + bytes([_crc8_31(pair)])
+        self.pending = None
+        if self.corrupt:
+            out[0] ^= 0x01
+            self.corrupt -= 1
+        return bytes(out[:nbytes])
+
+
 class FakeBus:
     """Stands in for ``machine.I2C``. Attach parts with ``attach(addr, part, path)``."""
 

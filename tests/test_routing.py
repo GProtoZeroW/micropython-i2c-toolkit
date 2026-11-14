@@ -189,11 +189,11 @@ def test_bench_mux_at_default_address_collides_with_shtc3():
 
 
 def test_bench_builds_on_fake_buses():
-    from micropython_i2c.fakes import FakeRelay, FakeTMP102, fake_vl53l4cd
+    from micropython_i2c.fakes import FakeRelay, FakeSHTC3, FakeTMP102, fake_vl53l4cd
 
     bus0, bus1 = FakeBus(), FakeBus()
     bus0.attach(0x71, FakeMux())
-    bus0.attach(0x70, FakeSensirion([0x6666, 0x8000], CommandI2CBase.crc), path=[(0x71, 0)])
+    bus0.attach(0x70, FakeSHTC3(rh=50.0), path=[(0x71, 0)])
     bus0.attach(0x48, FakeTMP102(), path=[(0x71, 2)])
     bus1.attach(0x29, fake_vl53l4cd())
     bus1.attach(0x18, FakeRelay())

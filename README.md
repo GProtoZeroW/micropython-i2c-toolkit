@@ -39,6 +39,7 @@ dev_notebooks/            module sources: each writes a module and its tests, ru
   drivers_tmp102_devNB    drivers/tmp102.py
   drivers_tca9548a_devNB  drivers/tca9548a.py
   drivers_tmag5273_devNB  drivers/tmag5273.py
+  drivers_shtc3_devNB     drivers/shtc3.py
 notebooks/                whole-bench hardware checks
   03_routing_harness      the whole bench: config -> validate -> scan -> build -> talk
 docs/design.md            why each layer is the way it is; limits and next steps
@@ -47,6 +48,16 @@ archive/                  the original single-file notebooks and the old bring-u
 ```
 
 ## The bench
+
+Connected now (2026-11-14):
+
+```
+I2C 0 (STEMMA QT, scl=9 sda=8)
+  SparkFun Qwiic SHTC3 @ 0x70
+```
+
+The other dev notebooks were validated on this wiring, found by their hardware sections
+(2026-11-13); reconnect it to rerun them:
 
 ```
 I2C 0 (STEMMA QT, scl=9 sda=8)
@@ -58,8 +69,7 @@ I2C 1 (scl=15 sda=16)
     ch 2: TMP102                 @ 0x48
 ```
 
-Found by the dev notebooks' hardware sections (2026-11-13). The SHTC3 is off the bench: it is
-always at 0x70, the mux's own address.
+The SHTC3 is always at 0x70, the mux's own address, so it never shares the mux's segment.
 
 ## Setup
 

@@ -26,7 +26,7 @@ PyVISA-style I2C connection layer, drivers and mux-aware routing for MicroPython
 - Run dev notebooks from `dev_notebooks/`. `%%extract` writes `../src/micropython_i2c/...`;
   test cells append to `../tests/test_<module>.py`.
 - Never hand-edit a file a dev notebook generates (it says so in its docstring). Edit the
-  notebook and re-run it. Converted so far: `drivers/tmp102.py`, `drivers/tca9548a.py`, `drivers/tmag5273.py`. Every other module is still
+  notebook and re-run it. Converted so far: `drivers/tmp102.py`, `drivers/tca9548a.py`, `drivers/tmag5273.py`, `drivers/shtc3.py`. Every other module is still
   hand-written until its dev notebook exists.
 - When a module is converted, add its module and test file to the generated-files lists in
   `pyproject.toml` (`I001` per-file ignore and `[tool.ruff.format] exclude`): the extractor's
