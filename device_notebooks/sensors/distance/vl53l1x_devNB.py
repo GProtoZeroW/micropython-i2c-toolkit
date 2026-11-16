@@ -25,10 +25,15 @@
 # > - **Hardware section:** run it one cell at a time, reading the **What to do** line above
 # >   each cell first.
 #
-# **Runs on the host first, the board last**, like the other dev notebooks. Everything down to
-# `# Hardware validation` runs on CPython against `micropython_i2c.fakes.FakeVL53L1X`. The last
-# section connects to the FeatherS3, uploads the freshly written package, checks the real
-# VL53L1X behind mux channel 7 with a matching test for every unit test above, then disconnects.
+# **Where each cell runs.** Everything above `%board connect` (the first cells of
+# `# Hardware validation`) runs in ordinary Python (CPython) on this computer, with no board: it
+# writes the fake part (`vl53l1x_fake.py`), the driver (`vl53l1x.py`) and their tests, and checks
+# the driver against the fake, in real and in simulated time. After `%board connect`, cells run
+# in MicroPython on the board, except `%%host` cells, which run on the computer. That section
+# uploads the freshly written package, checks the real VL53L1X behind mux channel 7 with a
+# matching test for every unit test above, then disconnects.
+#
+# micropylab has `%%extract` built in, so there is no `%load_ext jupyter_lab_extractor` cell.
 
 # %% [markdown]
 # # Hardware and configuration
@@ -95,12 +100,18 @@
 #
 # Not in the ULD source used here: the soft reset sequence (write `0x00` then `0x01` to
 # `0x0000`, 100 µs apart) is from ST's full VL53L1 API.
+#
+# Decided (2026-11-16): `FakeVL53L1X` moved out of `micropython_i2c.fakes` into this notebook
+# (`vl53l1x_fake.py`, next to the driver). Its distance, signal rate and ambient rate are plain
+# values or signals (`micropython_i2c.sim.signals`), read when the fake makes a sample, and its
+# timing runs on the `compat` clock, so `SimClock` drives it.
 
 # %% [markdown]
 # # Python file
-# location: `src/micropython_i2c/devices/sensors/distance/vl53l1x.py`
+# location: `src/micropython_i2c/devices/sensors/distance/vl53l1x.py` (driver) and
+# `src/micropython_i2c/devices/sensors/distance/vl53l1x_fake.py` (fake part, host only)
 #
-# tests: `tests/test_vl53l1x.py`
+# tests: `tests/test_vl53l1x.py` (both)
 
 # %% [markdown]
 # ## header
@@ -198,17 +209,26 @@ import pytest
 
 from micropython_i2c import I2CConnection
 from micropython_i2c.devices.sensors.distance.vl53l1x import VL53L1X, VL53L1XRegs, VL53L1XResult
-from micropython_i2c.fakes import FakeBus, FakeVL53L1X, fake_vl53l4cd
+from micropython_i2c.devices.sensors.distance.vl53l1x_fake import FakeVL53L1X
+from micropython_i2c.devices.sensors.distance.vl53l4cd_fake import FakeVL53L4CD
+from micropython_i2c.sim.bus import FakeBus
+from micropython_i2c.sim.clock import SimClock
+from micropython_i2c.sim.signals import ramp
 
 # %% [markdown]
-# Notebook-only: the imports the validation and test cells use. The classes under test are the
-# ones defined in this notebook, not the module's.
+# Notebook-only: the imports the validation and test cells use. The classes under test
+# (`FakeVL53L1X`, `VL53L1XRegs`, `VL53L1XResult`, `VL53L1X`) are the ones defined in this
+# notebook, not the modules'. `FakeVL53L4CD` (a part with another model ID) comes from
+# `vl53l4cd_devNB`.
 
 # %%
 import pytest
 
 from micropython_i2c import I2CConnection
-from micropython_i2c.fakes import FakeBus, FakeVL53L1X, fake_vl53l4cd
+from micropython_i2c.devices.sensors.distance.vl53l4cd_fake import FakeVL53L4CD
+from micropython_i2c.sim.bus import FakeBus
+from micropython_i2c.sim.clock import SimClock
+from micropython_i2c.sim.signals import ramp
 
 # %% [markdown]
 # # Intent
@@ -272,6 +292,363 @@ from micropython_i2c.fakes import FakeBus, FakeVL53L1X, fake_vl53l4cd
 # | `VL53L1XRegs` | facts: reference registers, register map (from the ULD), default configuration, distance-mode and timing-budget tables, range statuses |
 # | `VL53L1XResult` | one ranging result: distance, range status (code, name, `valid`), signal and ambient rates, SPAD count |
 # | `VL53L1X` | the driver: boot and identify on construction, continuous and one-shot ranging, distance mode, timing budget, inter-measurement period, ROI, offset, crosstalk, temperature update, soft reset, address change, codecs |
+#
+# The fake part, `FakeVL53L1X`, is in its own module, `vl53l1x_fake.py` (host only): see
+# `# Fake part`.
+
+# %% [markdown]
+# # Fake part
+# `FakeVL53L1X` stands in for the real part on a `FakeBus`, so the driver can be written and
+# tested on the host. It is written before the driver because the driver's tests need it. It
+# goes to its own module next to the driver, `vl53l1x_fake.py`, which the board never imports.
+
+# %% [markdown]
+# ## header
+
+# %%
+# %%extract ../../../src/micropython_i2c/devices/sensors/distance/vl53l1x_fake.py
+"""``FakeVL53L1X``: an ST VL53L1X register file and ranging sequencer, for host tests.
+
+Usage on the host::
+
+    from micropython_i2c.devices.sensors.distance.vl53l1x_fake import FakeVL53L1X
+    from micropython_i2c.sim.bus import FakeBus
+    from micropython_i2c.sim.signals import ramp
+
+    bus = FakeBus()
+    part = bus.attach(0x29, FakeVL53L1X(distance_mm=ramp(1200, 100, 0, 60)))
+
+The distance, signal rate and ambient rate are plain values or signals
+(``micropython_i2c.sim.signals``), read when the fake makes a sample. Timing goes through
+``micropython_i2c.compat``, so ``SimClock`` drives it. The address is programmable
+(``TAKES_ADDR``): the fake answers at whatever ``0x0001`` holds.
+
+Host only.
+
+Generated by ``device_notebooks/sensors/distance/vl53l1x_devNB``: edit the notebook, not this
+file.
+"""
+
+# %% [markdown]
+# ## Imports
+# `BitTools.sign_extend` for the offset register, the `compat` ticks for the sample timing, and
+# `value` to read a quantity that may be a signal.
+
+# %%
+# %%extract ../../../src/micropython_i2c/devices/sensors/distance/vl53l1x_fake.py -a
+from micropython_i2c.bits import BitTools
+from micropython_i2c.compat import ticks_add, ticks_diff, ticks_ms
+from micropython_i2c.sim.signals import value
+
+# %% [markdown]
+# ## Public names
+
+# %%
+# %%extract ../../../src/micropython_i2c/devices/sensors/distance/vl53l1x_fake.py -a
+__all__ = ["FakeVL53L1X"]
+
+# %% [markdown]
+# ## `FakeVL53L1X`
+# A 64 KiB register file with the ranging sequencer around it. It does not model the optics:
+# the distance and the result fields are attributes. What it models, and where each behaviour
+# comes from:
+#
+# | Behaviour | Source |
+# |---|---|
+# | 16-bit register indexes, multi-byte values MSB first | datasheet section 4, Table 9 |
+# | `0x010F..0x0111` read `EA CC 10`, and ignore writes | datasheet Table 8 |
+# | `0x00E5` bit 0 is "booted"; with `booted=False` it never sets | ULD `BootState`; datasheet 3.6 (boot within 1.2 ms) |
+# | `0x00DE` holds the oscillator word, `0x0025` by default | ULD `SetInterMeasurementInMs`; the value measured on the bench, 2026-11-14, `vl53l1x_devNB` diagnostics |
+# | `0x0087` = `0x40` ranges continuously, `0x10` once (then back to standby), `0x00` stops | ULD `StartRanging`, `StopRanging` |
+# | a sample is ready `sample_ms` after a start, or after an interrupt clear while ranging; no new sample before a clear | datasheet 3.4; `sample_ms` (default 2 ms) is the fake's, not the timing budget, so tests stay fast |
+# | the interrupt line is `0x0031` bit 0; `0x0030` bit 4 set makes it active low | ULD `GetInterruptPolarity`, `CheckForDataReady` |
+# | a sample fills the 17-byte block at `0x0089`: raw status, SPAD count (`0x008C`), ambient (`0x0090`) and signal (`0x0098`) rates in units of 8 kcps, and the distance (`0x0096`) | ULD `GetResult` |
+# | the distance includes the part-to-part offset in `0x001E` (signed 11.2 in 13 bits) | ULD `SetOffset` |
+# | `0x0001` is the 7-bit address; the part answers there at once | ULD `SetI2CAddress` |
+# | soft reset: `0x0000` written 0 holds the part at its power-on address, every register reads 0; written 1, the power-on registers come back and it boots | the reset sequence: ST's full VL53L1 API; the held state and the move back to `0x29` at once: measured on the bench, 2026-11-14, `vl53l1x_devNB` diagnostics |
+#
+# Not modelled: the optics (crosstalk, ROI, distance mode and budget do not change the result),
+# the timing budget and inter-measurement period (a sample takes `sample_ms`), temperature,
+# GPIO1 and XSHUT.
+#
+# `samples` counts the samples made and `writes` logs `(reg, data)` for every write, so a test
+# can check what the driver did.
+
+
+# %%
+# %%extract ../../../src/micropython_i2c/devices/sensors/distance/vl53l1x_fake.py -a
+class FakeVL53L1X:
+    """An ST VL53L1X register file and ranging sequencer (datasheet DS12385 rev 8, ST's ULD).
+
+    Args:
+        distance_mm: Distance to the target, mm: a number or a signal ``f(t_s)``.
+        status: Raw range status every sample reports (9 = valid).
+        signal_kcps: Return signal rate, kcps: a number or a signal.
+        ambient_kcps: Ambient rate, kcps: a number or a signal.
+        spads: SPAD count every sample reports.
+        osc: The oscillator calibration word at ``0x00DE``.
+        sample_ms: Time from a start (or an interrupt clear) to the sample.
+        addr: The power-on address (``0x0001`` after power-on and reset).
+        booted: False: the firmware never boots.
+
+    Attributes:
+        regs: The register file (``bytearray``, 64 KiB).
+        mode: The last mode-start value (``0x40``, ``0x10`` or ``0x00``).
+        ready: True while a sample waits for an interrupt clear.
+        in_reset: True while the soft reset is held.
+        samples: How many samples the fake has made.
+        writes: ``(reg, data)`` for every register write, in order.
+    """
+
+    TAKES_ADDR = True  # the address is programmable (0x0001)
+
+    ID_REGS = {0x010F: 0xEA, 0x0110: 0xCC, 0x0111: 0x10}
+    READ_ONLY = set(range(0x0089, 0x009A)) | {0x0031, 0x00DE, 0x00DF, 0x00E5} | set(ID_REGS)
+
+    def __init__(self, distance_mm=500, status=9, signal_kcps=8000, ambient_kcps=400, spads=40,
+                 osc=0x0025, sample_ms=2, addr=0x29, booted=True):  # fmt: skip
+        self.distance_mm = distance_mm
+        self.status = status
+        self.signal_kcps = signal_kcps
+        self.ambient_kcps = ambient_kcps
+        self.spads = spads
+        self.osc = osc
+        self.sample_ms = sample_ms
+        self.addr_por = addr
+        self.can_boot = booted
+        self.samples = 0
+        self.writes = []
+        self._power_on(booted)
+
+    def _power_on(self, booted):
+        self.regs = bytearray(0x10000)
+        self.in_reset = False
+        self.regs[0x0000] = 0x01  # soft reset released
+        for reg, val in self.ID_REGS.items():
+            self.regs[reg] = val
+        self.regs[0x0001] = self.addr_por
+        self.regs[0x00DE], self.regs[0x00DF] = self.osc >> 8, self.osc & 0xFF
+        self.regs[0x00E5] = 1 if booted else 0
+        self.mode = 0x00
+        self.ready = False
+        self.due = None  # ticks_ms when the next sample is ready (None: none coming)
+
+    @property
+    def bus_addr(self):
+        """The address the part answers at (``0x0001``)."""
+        return self.regs[0x0001] & 0x7F
+
+    def _tick(self):
+        """Make the pending sample if its time has come."""
+        if self.due is not None and not self.ready and ticks_diff(ticks_ms(), self.due) >= 0:
+            self._sample()
+            self.due = None
+            if self.mode == 0x10:  # one-shot: back to standby after its sample
+                self.mode = 0x00
+
+    @staticmethod
+    def _rate(kcps):
+        """A rate in kcps as the 16-bit register word (units of 8 kcps)."""
+        return max(0, min(0xFFFF, int(kcps) // 8))
+
+    def _sample(self):
+        """Fill the result block, reading the quantities (signals) now."""
+        raw = (self.regs[0x001E] << 8) | self.regs[0x001F]
+        offset = BitTools.sign_extend(raw, 13) / 4
+        mm = max(0, min(0xFFFF, int(value(self.distance_mm) + offset)))
+        amb, sig = self._rate(value(self.ambient_kcps)), self._rate(value(self.signal_kcps))
+        block = bytearray(17)
+        block[0] = self.status & 0x1F
+        block[3] = self.spads & 0xFF  # 0x008C: SPAD count, integer part
+        block[7], block[8] = amb >> 8, amb & 0xFF  # 0x0090
+        block[13], block[14] = mm >> 8, mm & 0xFF  # 0x0096
+        block[15], block[16] = sig >> 8, sig & 0xFF  # 0x0098
+        self.regs[0x0089:0x009A] = block
+        self.ready = True
+        self.samples += 1
+
+    def _line(self):
+        active_low = bool(self.regs[0x0030] & 0x10)
+        return int(self.ready) ^ int(active_low)
+
+    def _schedule(self):
+        self.due = ticks_add(ticks_ms(), self.sample_ms)
+
+    def mem_read(self, reg, nbytes):
+        self._tick()
+        out = bytearray()
+        for i in range(nbytes):
+            r = (reg + i) & 0xFFFF
+            if self.in_reset:
+                out.append(0)
+            else:
+                out.append(self._line() if r == 0x0031 else self.regs[r])
+        return bytes(out)
+
+    def mem_write(self, reg, data):
+        self._tick()
+        self.writes.append((reg, bytes(data)))
+        for i, val in enumerate(data):
+            r = (reg + i) & 0xFFFF
+            if r == 0x0000:
+                if val & 1 == 0:  # reset asserted: held, every register reads 0
+                    self.mode, self.ready, self.due = 0x00, False, None
+                    self.in_reset = True
+                    self.regs[0x0001] = self.addr_por  # back at once (measured)
+                elif self.in_reset:  # released: power-on registers, then boot
+                    self._power_on(self.can_boot)
+                continue
+            if self.in_reset or r in self.READ_ONLY:
+                continue
+            self.regs[r] = val
+            if r == 0x0086 and val & 1:  # clear the interrupt
+                self.ready = False
+                if self.mode == 0x40:
+                    self._schedule()
+            elif r == 0x0087:
+                self.mode = val
+                if val in (0x40, 0x10):
+                    self._schedule()
+                else:
+                    self.due = None
+
+
+# %% [markdown]
+# ### validation/test
+# Notebook-only helpers for the fake's own checks: read and write the fake at `0x29` with
+# 16-bit register indexes, the way the driver does.
+
+
+# %%
+def rd(bus, reg, n=1, addr=0x29):
+    return bus.readfrom_mem(addr, reg, n, addrsize=16)
+
+
+def wr(bus, reg, data, addr=0x29):
+    bus.writeto_mem(addr, reg, bytes(data), addrsize=16)
+
+
+# %% [markdown]
+# #### validation: nominal usage
+# The reference registers (Table 8), then one continuous sample in simulated time with the
+# target on a `ramp` from 1000 to 200 mm over 10 s: the sample made at 5 s reads about 600 mm.
+
+# %%
+with SimClock() as clock:
+    bus = FakeBus()
+    part = bus.attach(0x29, FakeVL53L1X(distance_mm=ramp(1000, 200, 0, 10)))
+    print("0x010F..0x0111:", rd(bus, 0x010F, 3).hex(" "), "| want ea cc 10")
+    clock.advance(5)
+    wr(bus, 0x0087, [0x40])  # start continuous ranging
+    clock.advance(0.002)
+    print("interrupt line at 5.002 s:", rd(bus, 0x0031)[0], "(1 = sample ready, active high)")
+    block = rd(bus, 0x0089, 17)
+    print("raw status {}, distance {} mm (want about 600)".format(
+        block[0], (block[13] << 8) | block[14]))  # fmt: skip
+
+# %% [markdown]
+# #### validation: anti-nominal usage
+# After the address register is set to `0x30`, the part no longer answers at `0x29`: the bus
+# refuses the transfer, as a real NACK would.
+
+# %%
+bus = FakeBus()
+part = bus.attach(0x29, FakeVL53L1X())
+wr(bus, 0x0001, [0x30])  # move the part to 0x30
+try:
+    rd(bus, 0x010F, 2)  # still talking to 0x29
+except OSError as err:
+    print("raised OSError, as expected:\n    {}".format(err))
+else:
+    raise AssertionError("a read at the old address should have raised OSError")
+finally:
+    print("answers at:", [hex(a) for a in bus.scan()])
+
+# %% [markdown]
+# #### unit
+
+# %% [markdown]
+# The reference registers read the Table 8 values and ignore writes.
+
+# %%
+# %%extract ../../../tests/test_vl53l1x.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_reference_registers_follow_table_8():
+    bus = FakeBus()
+    bus.attach(0x29, FakeVL53L1X())
+    bus.writeto_mem(0x29, 0x010F, b"\x00\x00\x00", addrsize=16)
+    assert bus.readfrom_mem(0x29, 0x010F, 3, addrsize=16) == b"\xea\xcc\x10"
+
+
+# %% [markdown]
+# A sample is made `sample_ms` after a start, and the next one only after the interrupt is
+# cleared (datasheet 3.4), however long the host waits.
+
+# %%
+# %%extract ../../../tests/test_vl53l1x.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_new_sample_only_after_an_interrupt_clear():
+    with SimClock() as clock:
+        bus = FakeBus()
+        part = bus.attach(0x29, FakeVL53L1X(sample_ms=50))
+        bus.writeto_mem(0x29, 0x0087, b"\x40", addrsize=16)
+        clock.advance(0.049)
+        assert bus.readfrom_mem(0x29, 0x0031, 1, addrsize=16) == b"\x00"
+        clock.advance(10)
+        assert bus.readfrom_mem(0x29, 0x0031, 1, addrsize=16) == b"\x01" and part.samples == 1
+        bus.writeto_mem(0x29, 0x0086, b"\x01", addrsize=16)
+        clock.advance(0.050)
+        assert bus.readfrom_mem(0x29, 0x0031, 1, addrsize=16) == b"\x01" and part.samples == 2
+
+
+# %% [markdown]
+# The distance, signal and ambient rates are read when the sample is made: a signal gives the
+# value at that moment, and the rates land in units of 8 kcps.
+
+# %%
+# %%extract ../../../tests/test_vl53l1x.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_quantities_are_read_when_sampled():
+    with SimClock() as clock:
+        bus = FakeBus()
+        part = FakeVL53L1X(distance_mm=ramp(1000, 0, 0, 10), signal_kcps=lambda t: 800 * t,
+                           ambient_kcps=80, sample_ms=1)  # fmt: skip
+        bus.attach(0x29, part)
+        clock.advance(2.5)
+        bus.writeto_mem(0x29, 0x0087, b"\x10", addrsize=16)  # one shot
+        clock.advance(0.5)
+        block = bus.readfrom_mem(0x29, 0x0089, 17, addrsize=16)
+        assert (block[13] << 8) | block[14] == 700  # at 3.0 s: made at the first read after due
+        assert ((block[15] << 8) | block[16], (block[7] << 8) | block[8]) == (300, 10)
+
+
+# %% [markdown]
+# Asserting the soft reset (`0x0000` = 0) moves the part back to its power-on address at once
+# and makes every register read 0 (both measured); releasing it brings back the power-on
+# registers and boots.
+
+# %%
+# %%extract ../../../tests/test_vl53l1x.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_soft_reset_holds_and_restores():
+    bus = FakeBus()
+    bus.attach(0x29, FakeVL53L1X())
+    bus.writeto_mem(0x29, 0x0001, b"\x30", addrsize=16)
+    bus.writeto_mem(0x30, 0x0000, b"\x00", addrsize=16)
+    assert bus.scan() == [0x29]
+    assert bus.readfrom_mem(0x29, 0x010F, 3, addrsize=16) == b"\x00\x00\x00"
+    bus.writeto_mem(0x29, 0x0000, b"\x01", addrsize=16)
+    assert bus.readfrom_mem(0x29, 0x010F, 3, addrsize=16) == b"\xea\xcc\x10"
+    assert bus.readfrom_mem(0x29, 0x00E5, 1, addrsize=16) == b"\x01"
+
 
 # %% [markdown]
 # # Code
@@ -501,7 +878,7 @@ regs.reg_write(regs.REG_MODEL_ID, 0x00)  # a read-only register
 try:
     regs.reg_set(regs.REG_MODEL_ID, 0x00)
 except ValueError as err:
-    print(f"raised ValueError, as expected:\n    {err}")
+    print("raised ValueError, as expected:\n    {}".format(err))
 else:
     raise AssertionError("writing the model ID should not have taken")
 
@@ -668,7 +1045,8 @@ RESULT_BLOCK = bytes([0x09, 0, 0, 42, 0, 0, 0, 0, 50, 0, 0, 0, 0, 0, 243, 0x03, 
 r = VL53L1XResult.from_block(RESULT_BLOCK)
 print(r)
 for raw, code, valid in STATUS_CASES:
-    print(f"raw {raw:2}: {VL53L1XResult.status_decode(raw)} (want code {code}, valid {valid})")
+    print("raw {:2}: {} (want code {}, valid {})".format(
+        raw, VL53L1XResult.status_decode(raw), code, valid))  # fmt: skip
 
 # %% [markdown]
 # #### validation: anti-nominal usage
@@ -678,7 +1056,7 @@ for raw, code, valid in STATUS_CASES:
 try:
     VL53L1XResult.from_block(RESULT_BLOCK[:16])  # one byte short
 except ValueError as err:
-    print(f"raised ValueError, as expected:\n    {err}")
+    print("raised ValueError, as expected:\n    {}".format(err))
 else:
     raise AssertionError("a 16-byte block should have raised ValueError")
 
@@ -1225,10 +1603,10 @@ IM_CASES = [(100, 0x01F4, 53750), (33, 0x01F4, 17737), (100, 0xFDF4, 53750)]
 
 # %%
 for mm, word in OFFSET_CASES:
-    print(f"offset {mm:>7} mm -> {VL53L1X.offset_encode(mm):#06x} (want {word:#06x})"
-          f" -> {VL53L1X.offset_decode(VL53L1X.offset_encode(mm))} mm")  # fmt: skip
+    print("offset {:>7} mm -> {:#06x} (want {:#06x}) -> {} mm".format(
+        mm, VL53L1X.offset_encode(mm), word, VL53L1X.offset_decode(VL53L1X.offset_encode(mm))))  # fmt: skip
 for w, h, byte in ROI_CASES:
-    print(f"ROI {w}x{h} -> {VL53L1X.roi_encode(w, h):#04x} (want {byte:#04x})")
+    print("ROI {}x{} -> {:#04x} (want {:#04x})".format(w, h, VL53L1X.roi_encode(w, h), byte))
 print("timing words, long 100 ms:", [hex(w) for w in VL53L1X.timing_words("long", 100)])
 
 # %% [markdown]
@@ -1239,7 +1617,7 @@ print("timing words, long 100 ms:", [hex(w) for w in VL53L1X.timing_words("long"
 try:
     VL53L1X.timing_words("long", 20)  # 20 ms needs short mode
 except ValueError as err:
-    print(f"raised ValueError, as expected:\n    {err}")
+    print("raised ValueError, as expected:\n    {}".format(err))
 else:
     raise AssertionError("20 ms in long mode should have raised ValueError")
 
@@ -1325,8 +1703,9 @@ def test_inter_measurement_codec(ms, osc, word):
 
 # %%
 tof, part = on_fake(VL53L1X, distance_mm=243)
-print(f"ID {tof.ident:#06x} | {tof.distance_mode} mode, {tof.timing_budget_ms} ms budget,"
-      f" {tof.inter_measurement_ms} ms period | ROI {tof.roi} centre {tof.roi_center}")  # fmt: skip
+print("ID {:#06x} | {} mode, {} ms budget, {} ms period | ROI {} centre {}".format(
+    tof.ident, tof.distance_mode, tof.timing_budget_ms, tof.inter_measurement_ms, tof.roi,
+    tof.roi_center))  # fmt: skip
 print("one-shot:", tof.measure())
 tof.start()
 print("continuous:", [tof.read().distance_mm for _ in range(3)])
@@ -1340,11 +1719,11 @@ print("samples made by the fake:", part.samples)
 
 # %%
 bus = FakeBus()
-bus.attach(0x29, fake_vl53l4cd())
+bus.attach(0x29, FakeVL53L4CD())
 try:
     VL53L1X(I2CConnection(bus, 0x29))  # a VL53L4CD, not a VL53L1X
 except RuntimeError as err:
-    print(f"raised RuntimeError, as expected:\n    {err}")
+    print("raised RuntimeError, as expected:\n    {}".format(err))
 else:
     raise AssertionError("a VL53L4CD should have raised RuntimeError")
 
@@ -1377,7 +1756,7 @@ def test_init_identifies_and_configures():
 
 def test_init_refuses_a_part_that_is_not_a_vl53l1x():
     bus = FakeBus()
-    bus.attach(0x29, fake_vl53l4cd())
+    bus.attach(0x29, FakeVL53L4CD())
     with pytest.raises(RuntimeError, match="ID 0xebaa"):
         VL53L1X(I2CConnection(bus, 0x29))
 
@@ -1661,6 +2040,95 @@ def test_address_change():
     assert bus.scan() == [0x29]
     with pytest.raises(ValueError):
         tof.address_set(0x78)
+
+
+# %% [markdown]
+# ### validation/test: in simulated time
+# The driver against the fake inside `with SimClock() as clock:`, where every sleep returns at
+# once and moves the clock, so a minute of ranging runs in milliseconds. A hand approaches the
+# sensor: the target is a `ramp` from 1200 mm to 100 mm over the first 60 s, then holds. The
+# fake takes `sample_ms=100` per sample (the 100 ms budget) and is read in continuous mode.
+#
+# This block has no matching hardware test: the hardware section's continuous-ranging checks
+# use a hand held still.
+
+# %% [markdown]
+# #### validation: nominal usage
+# One reading every 10 simulated seconds over 80 s.
+
+# %%
+with SimClock() as clock:
+    tof, part = on_fake(VL53L1X, distance_mm=ramp(1200, 100, 0, 60), sample_ms=100)
+    tof.start()
+    for _ in range(9):
+        r = tof.read()
+        print("t = {:5.1f} s: {:4} mm, {}".format(clock.now_s(), r.distance_mm, r.status_name))
+        clock.advance(10)
+    tof.stop()
+    print("samples made:", part.samples, "| sleeps served:", clock.sleeps)
+
+# %% [markdown]
+# #### validation: anti-nominal usage
+# Ranging stopped, nothing follows the hand: `read()` waits its timeout in simulated time
+# (instantly in real time) and raises `OSError`.
+
+# %%
+with SimClock() as clock:
+    tof, part = on_fake(VL53L1X, distance_mm=ramp(1200, 100, 0, 60), sample_ms=100)
+    t0 = clock.now_s()
+    try:
+        tof.read()  # never started
+    except OSError as err:
+        print("raised OSError, as expected:\n    {}".format(err))
+    else:
+        raise AssertionError("read() without start() should have raised OSError")
+    finally:
+        print("simulated wait: {:.3f} s".format(clock.now_s() - t0))
+
+# %% [markdown]
+# #### unit
+
+# %% [markdown]
+# The driver follows a hand approaching along a ramp: each continuous reading is within a few
+# millimetres of the ramp at that moment, and the readings fall.
+
+# %%
+# %%extract ../../../tests/test_vl53l1x.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_follows_a_hand_approaching_in_simulated_time():
+    hand = ramp(1200, 100, 0, 60)
+    with SimClock() as clock:
+        tof, _ = on_fake(VL53L1X, distance_mm=hand, sample_ms=100)
+        tof.start()
+        readings = []
+        for _ in range(7):
+            r = tof.read()
+            assert r.valid and abs(r.distance_mm - hand(clock.now_s())) <= 5
+            readings.append(r.distance_mm)
+            clock.advance(10)
+        tof.stop()
+    assert readings == sorted(readings, reverse=True) and readings[-1] <= 105
+
+
+# %% [markdown]
+# A one-shot measurement waits for the sample in simulated time: with a 100 ms sample it takes
+# at least 100 ms of the clock, and the distance is the target's at that moment.
+
+# %%
+# %%extract ../../../tests/test_vl53l1x.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_one_shot_waits_for_the_sample_in_simulated_time():
+    with SimClock() as clock:
+        tof, _ = on_fake(VL53L1X, distance_mm=lambda t: 1000 - 10 * t, sample_ms=100)
+        t0 = clock.now_s()
+        r = tof.measure()
+        took = clock.now_s() - t0
+    assert 0.1 <= took <= 0.11
+    assert r.valid and abs(r.distance_mm - (1000 - 10 * (t0 + took))) <= 1
 
 
 # %% [markdown]
