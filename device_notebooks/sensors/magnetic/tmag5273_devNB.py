@@ -25,10 +25,12 @@
 # > - **Hardware section:** run it one cell at a time, reading the **What to do** line above
 # >   each cell first.
 #
-# **Runs on the host first, the board last**, like `tmp102_devNB`. Everything down to
-# `# Hardware validation` runs on CPython against `micropython_i2c.fakes.FakeTMAG5273`. The last
-# section connects to the FeatherS3, uploads the freshly written package, checks the real
-# TMAG5273 behind the mux with a matching test for every unit test above, then disconnects.
+# **Where each cell runs.** Everything above `%board connect` runs in ordinary Python (CPython)
+# on this computer, against `FakeTMAG5273` (written by this notebook to
+# `devices/sensors/magnetic/tmag5273_fake.py`), partly in simulated time (`SimClock`). After
+# `%board connect`, cells run in MicroPython on the board, except `%%host` cells, which run on
+# this computer. The last section uploads the freshly written package, checks the real TMAG5273
+# behind the mux with a matching test for every driver unit test above, then disconnects.
 
 # %% [markdown]
 # # Hardware and configuration
@@ -39,10 +41,10 @@
 # | **Runs on** | CPython 3.13.15 in the micropylab kernel (1.0.0a1), no board | Unexpected Maker FeatherS3 (ESP32-S3), MicroPython 1.28.0 (v1.28.0, 2026-04-06), USB `/dev/ttyACM0` |
 # | **I2C bus** | `FakeBus` | `machine.I2C(1)`, **bus 1**, scl=15 sda=16, 100 kHz (`bus_open("feathers3", 1)`) |
 # | **Mux** | `FakeMux` at `0x70`, channel 0, only in tests that ask for it (`mux=True`); the rest talk to the part directly | SparkFun Qwiic Mux (TCA9548A) at `0x70` (address jumpers open), **channel 0** |
-# | **Sensor** | `FakeTMAG5273`: a B1 at `0x22`, power-on state, field (5, -5, 0) mT, 25 C | SparkFun Qwiic TMAG5273, a **B1** (TMAG5273B1) at `0x22` |
+# | **Sensor** | `FakeTMAG5273` (`tmag5273_fake`): a B1 at `0x22`, power-on state, field (5, -5, 0) mT, 25 C, or signals in simulated time | SparkFun Qwiic TMAG5273, a **B1** (TMAG5273B1) at `0x22` |
 # | **Other parts used** | none | TMP102 at `0x48` on mux channel 2: the reference for the temperature check |
 # | **Datasheet** | TI SLYS045C (rev C, April 2026) | same |
-# | **Result** | 36 unit tests pass | 79 of 79 hardware checks passed (2026-11-14) |
+# | **Result** | 54 unit tests pass (90 cases): 15 for the fake, 39 for the driver, 3 of them in simulated time | 79 of 79 hardware checks passed (2026-11-14) |
 #
 # Nothing else on bus 1 is touched. Bus 0 is not used by this notebook. To rerun the hardware
 # section, wire the bench this way again (README "The bench").
@@ -71,6 +73,8 @@
 # %% [markdown]
 # # Python file
 # location: `src/micropython_i2c/devices/sensors/magnetic/tmag5273.py`
+#
+# fake part: `src/micropython_i2c/devices/sensors/magnetic/tmag5273_fake.py`
 #
 # tests: `tests/test_tmag5273.py`
 
@@ -166,11 +170,14 @@ import pytest
 
 from micropython_i2c import I2CConnection
 from micropython_i2c.devices.sensors.magnetic.tmag5273 import TMAG5273, TMAG5273Regs
-from micropython_i2c.fakes import FakeBus, FakeMux, FakeRegisterPart, FakeTMAG5273
+from micropython_i2c.devices.sensors.magnetic.tmag5273_fake import FakeTMAG5273, crc8_07
+from micropython_i2c.sim.bus import FakeBus, FakeMux, FakeRegisterPart
+from micropython_i2c.sim.clock import SimClock
+from micropython_i2c.sim.signals import ramp, sine
 
 # %% [markdown]
-# Notebook-only: the imports the validation and test cells use. The classes under test are the
-# ones defined in this notebook, not the module's.
+# Notebook-only: the imports the validation and test cells use. The classes under test (the
+# driver and the fake) are the ones defined in this notebook, not the modules'.
 
 # %%
 import math
@@ -178,7 +185,9 @@ import math
 import pytest
 
 from micropython_i2c import I2CConnection
-from micropython_i2c.fakes import FakeBus, FakeMux, FakeRegisterPart, FakeTMAG5273
+from micropython_i2c.sim.bus import FakeBus, FakeMux, FakeRegisterPart
+from micropython_i2c.sim.clock import SimClock
+from micropython_i2c.sim.signals import ramp, sine
 
 # %% [markdown]
 # # Intent
@@ -240,6 +249,619 @@ from micropython_i2c.fakes import FakeBus, FakeMux, FakeRegisterPart, FakeTMAG52
 # |---|---|
 # | `TMAG5273Regs` | datasheet facts: registers, fields, code tables, CRC parameters, ranges, timing |
 # | `TMAG5273` | the driver: codecs, configuration, standard and fast reads, angle, offsets, status, sleep/wake |
+
+# %% [markdown]
+# # Fake part
+# `FakeTMAG5273`: the part the host run talks to. It is written to its own module next to the
+# driver, so the bench simulation (`sim.bench`) and other notebooks can use it too. Its tests go
+# to the same test file as the driver's. It comes before `# Code` because the driver's
+# validation needs it.
+
+# %% [markdown]
+# ## header
+
+# %%
+# %%extract ../../../src/micropython_i2c/devices/sensors/magnetic/tmag5273_fake.py
+"""``FakeTMAG5273``: a TMAG5273 register file and fast-read stream for host-side tests.
+
+Attach it to a ``FakeBus`` at its address (it needs ``addr=``: the fast-read CRC covers the
+address bytes it hears). The field ``field_mT`` (X, Y, Z) and the die temperature ``temp_c``
+are plain numbers or signals (``micropython_i2c.sim.signals``), read when the part converts::
+
+    from micropython_i2c.sim.bus import FakeBus
+    from micropython_i2c.sim.signals import ramp
+    from micropython_i2c.devices.sensors.magnetic.tmag5273_fake import FakeTMAG5273
+
+    bus = FakeBus()
+    part = bus.attach(0x22, FakeTMAG5273(addr=0x22, field_mT=(ramp(0.0, 10.0, 0, 60), 0.0, 0.0)))
+
+Modelled from TI SLYS045C (rev C, April 2026) and the bench measurements of
+``tmag5273_devNB`` (2026-11-13/14).
+
+Host only.
+
+Generated by ``device_notebooks/sensors/magnetic/tmag5273_devNB``: edit the notebook, not this file.
+"""
+
+# %% [markdown]
+# ## Imports
+# External: `math` for the angle. Internal: `BitTools.sign_extend` for the offset codes, and
+# `sim.signals` (its `value`) to read the field and temperature at the moment of a conversion.
+
+# %%
+# %%extract ../../../src/micropython_i2c/devices/sensors/magnetic/tmag5273_fake.py -a
+import math
+
+from micropython_i2c.bits import BitTools
+from micropython_i2c.sim import signals
+
+# %% [markdown]
+# ## Public names
+
+# %%
+# %%extract ../../../src/micropython_i2c/devices/sensors/magnetic/tmag5273_fake.py -a
+__all__ = ["FakeTMAG5273", "crc8_07"]
+
+# %% [markdown]
+# ## `crc8_07`
+# The TMAG5273's checksum: CRC-8, polynomial `0x07`, seeded `0xFF` (rev C, section 6.5.1.3.6).
+# The fake computes it on its own, bit by bit, so a test that compares the driver's CRC with the
+# fake's compares two independent implementations.
+
+# %%
+# %%extract ../../../src/micropython_i2c/devices/sensors/magnetic/tmag5273_fake.py -a
+def crc8_07(data, crc=0xFF):
+    """CRC-8, polynomial 0x07, seeded 0xFF (the TMAG5273's)."""
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x07) & 0xFF if crc & 0x80 else (crc << 1) & 0xFF
+    return crc
+
+
+# %% [markdown]
+# ## `FakeTMAG5273`
+# The behaviour comes from the old `FakeTMAG5273` in the retired `fakes.py`, which was checked
+# against the real B1 on the bench; only the signals are new. Every behaviour it models, and where
+# it comes from:
+#
+# | Behaviour | Source |
+# |---|---|
+# | Power-on values: `DEVICE_ID.VER` = `version`, manufacturer ID `0x5449` ("TI") LSB first, `I2C_ADDRESS` = `addr << 1`, `POR` set, `INTB_RB` high (the INT line idles high), every config register 0 | rev C, section 8.1 (register map and reset values) |
+# | ID and result registers are read-only; reserved bits (`SENSOR_CONFIG_2` bit 7, `INT_CONFIG_1` bit 1) read 0 | rev C, Tables 8-6 and 8-11 |
+# | `POR` and the four `DEVICE_STATUS` errors are write-1-to-clear | rev C, sections 8.1.25 and 8.1.29 |
+# | Bit 7 of the register address byte triggers a conversion (standby, `TRIGGER_MODE` 0) | rev C, section 6.5.1.3.1 |
+# | Continuous mode converts before every transfer; standby converts only on a trigger | rev C, `OPERATING_MODE` (Table 8-4) |
+# | A conversion fills the enabled result registers (Equation 10 at the selected range, Equation 12 for temperature), rolls `SET_COUNT` and sets `RESULT_STATUS` | rev C, Equations 10 and 12, section 8.1.25 |
+# | The angle and the offset correction apply to the `ANGLE_EN` pair | rev C, section 6.5.2.3, Equation 16 |
+# | Fast reads (`I2C_RD` 1 or 2) stream T (if enabled), each `MAG_CH_EN` axis **once, in name order** (`ZX`: Z, X), `CONV_STATUS`, then the CRC | rev C, 6.5.1.3.4-5; order measured 2026-11-14, `tmag5273_devNB` diagnostics "What does fast16 send for the two-axis and pseudo-simultaneous codes?" |
+# | The fast-read CRC covers every address byte the part heard since its own last transfer (`hear`), then the data; behind a mux that includes the mux's address byte | measured 2026-11-13/14, diagnostics "Which bytes does the fast-read CRC cover?" |
+# | With `CRC_EN`, a standard read longer than four bytes gets a CRC over the four data bytes as its fifth byte | rev C, 6.5.1.3.6; measured, diagnostics "What does the standard-read CRC cover?" |
+# | In a fast read mode a register read does not return the register (the B1 sent `00 90 00` for `DEVICE_ID`); the fake returns the packet | measured, diagnostics "What does a register read return in fast16?"; returning the packet is an assumption |
+# | In sleep or wake-and-sleep the first transfer wakes the part but is not acknowledged (`OSError`); the part is then in standby | rev C, section 5.11, note 1 |
+# | `field_mT` (X, Y, Z) and `temp_c` are plain values or signals, read with `value()` **at conversion time** | the simulation, not the part |
+# | `corrupt`: the number of upcoming fast-read packets to flip one bit in | a test hook, not the part |
+#
+# Not modelled: thresholds and interrupts, the gain correction, programming a new address
+# through `I2C_ADDRESS` (the register is writable but the part keeps answering at `addr`), the
+# conversion time, and the other devices' data bytes the real part also overhears. The address
+# matters to the CRC, so the class sets `TAKES_ADDR = True`.
+
+# %%
+# %%extract ../../../src/micropython_i2c/devices/sensors/magnetic/tmag5273_fake.py -a
+class FakeTMAG5273:
+    """A TMAG5273 register file and fast-read stream, close enough to test a driver on the host.
+
+    Args:
+        addr: The bus address it is attached at; it goes into ``I2C_ADDRESS`` and the fast-read
+            CRC.
+        field_mT: (X, Y, Z) field in mT; each a number or a signal, or the tuple a signal.
+        temp_c: Die temperature in C, a number or a signal.
+        version: ``DEVICE_ID.VER``: 1 for +-40/80 mT, 2 for +-133/266 mT.
+
+    Attributes:
+        regs: The register file, ``0x00..0x1C``.
+        asleep: True between a write that selects sleep or wake-and-sleep and the next transfer.
+        corrupt: Number of upcoming fast-read packets to flip one bit in.
+        heard: Address bytes heard on the bus since this part's own last transfer.
+        conversions: How many conversions the part has made.
+    """
+
+    TAKES_ADDR = True  # the fast-read CRC covers the part's own address byte
+
+    T_ADC_T0 = 17508
+    T_ADC_RES = 58.0  # LSB per C, rev C (rev A said 60.1)
+    RANGES = {1: (40.0, 80.0), 2: (133.0, 266.0)}  # per DEVICE_ID.VER
+    SEQ = {0x1: "X", 0x2: "Y", 0x3: "XY", 0x4: "Z", 0x5: "ZX", 0x6: "YZ", 0x7: "XYZ",
+           0x8: "XYX", 0x9: "YXY", 0xA: "YZY", 0xB: "XZX"}  # fmt: skip
+    PAIRS = {1: (0, 1), 2: (1, 2), 3: (0, 2)}  # ANGLE_EN -> axis indices
+    WRITABLE = {0x03: 0x7F, 0x08: 0xFD}  # registers with reserved bits; others 0x00-0x0C all
+    W1C = {0x18: 0x10, 0x1C: 0x0F}
+
+    def __init__(self, addr=0x35, field_mT=(5.0, -5.0, 0.0), temp_c=25.0, version=1):
+        self.addr = addr
+        self.field_mT = field_mT  # kept as given: read with value() at each conversion
+        self.temp_c = temp_c
+        self.version = version
+        self.regs = bytearray(0x1D)
+        self.regs[0x0C] = addr << 1
+        self.regs[0x0D] = version
+        self.regs[0x0E], self.regs[0x0F] = 0x49, 0x54  # "TI", LSB first
+        self.regs[0x18] = 0x10  # POR
+        self.regs[0x1C] = 0x10  # INTB_RB: the INT line reads high
+        self.pointer = 0
+        self.asleep = False
+        self.corrupt = 0
+        self.heard = bytearray()  # address bytes heard since this part's last transfer
+        self.conversions = 0
+
+    # Helpers.
+
+    def _field(self, reg, shift, width):
+        return (self.regs[reg] >> shift) & ((1 << width) - 1)
+
+    def _range(self, axis):
+        bit = self._field(0x03, 0, 1) if axis == 2 else self._field(0x03, 1, 1)
+        return self.RANGES[self.version][bit]
+
+    def _wake_check(self):
+        if self.asleep:
+            self.asleep = False
+            self.regs[0x01] &= ~0x03  # woken into standby
+            raise OSError(19, "ENODEV")  # the waking address is not acknowledged
+
+    def _begin(self):
+        self._wake_check()
+        if self._field(0x01, 0, 2) == 2:  # continuous: a fresh conversion every access
+            self._convert()
+
+    def _convert(self):
+        self.conversions += 1
+        field = list(signals.value(self.field_mT))  # the signals, sampled now
+        pair = self.PAIRS.get(self._field(0x03, 2, 2))
+        if pair:
+            for reg, ax in zip((0x0A, 0x0B), pair):
+                off = BitTools.sign_extend(self.regs[reg], 8)
+                field[ax] += off / 4096 * 2 * self._range(ax)
+        axes = set(self.SEQ.get(self._field(0x02, 4, 4), ""))
+        for i, name in enumerate("XYZ"):
+            if name in axes:
+                fs = self._range(i)
+                counts = int(round(field[i] * 65536 / (2 * fs)))
+                counts = max(-32768, min(32767, counts)) & 0xFFFF
+                self.regs[0x12 + 2 * i], self.regs[0x13 + 2 * i] = counts >> 8, counts & 0xFF
+        if self.regs[0x07] & 1:
+            code = int(self.T_ADC_T0 + (signals.value(self.temp_c) - 25.0) * self.T_ADC_RES + 0.5)
+            self.regs[0x10], self.regs[0x11] = code >> 8, code & 0xFF
+        if pair:
+            deg = math.degrees(math.atan2(field[pair[1]], field[pair[0]])) % 360.0
+            word = (int(deg) << 4) | int((deg - int(deg)) * 16)
+            self.regs[0x19], self.regs[0x1A] = word >> 8, word & 0xFF
+        count = (self.regs[0x18] >> 5) + 1
+        self.regs[0x18] = ((count & 7) << 5) | (self.regs[0x18] & 0x10) | 0x01
+
+    def _streamed(self):
+        out = "T" if self.regs[0x07] & 1 else ""
+        for axis in self.SEQ.get(self._field(0x02, 4, 4), ""):
+            if axis not in out:
+                out += axis
+        return out
+
+    def _packet(self):
+        mode = self._field(0x00, 0, 2)
+        names = self._streamed()
+        body = bytearray()
+        for name in names:
+            reg = 0x10 if name == "T" else 0x12 + 2 * "XYZ".index(name)
+            body += self.regs[reg : reg + (2 if mode == 1 else 1)]
+        body.append(self.regs[0x18])
+        if self.regs[0x00] & 0x80:
+            body.append(crc8_07(bytes(self.heard) + body))  # heard ends with the read command
+        if self.corrupt:
+            body[0] ^= 0x01
+            self.corrupt -= 1
+        return bytes(body)
+
+    def _read(self, reg, nbytes):
+        if self._field(0x00, 0, 2):  # fast mode: any read returns the packet (assumed)
+            return self._packet()[:nbytes]
+        data = bytes(self.regs[(reg + i) % len(self.regs)] for i in range(nbytes))
+        if self.regs[0x00] & 0x80 and nbytes > 4:
+            data = data[:4] + bytes([crc8_07(data[:4])]) + b"\xff" * (nbytes - 5)
+        return data
+
+    def _write(self, reg, data):
+        for i, b in enumerate(data):
+            r = reg + i
+            if r in self.W1C:
+                self.regs[r] &= ~(b & self.W1C[r]) & 0xFF
+            elif r <= 0x0C:
+                self.regs[r] = b & self.WRITABLE.get(r, 0xFF)
+        if self._field(0x01, 0, 2) in (1, 3):  # sleep, wake-and-sleep
+            self.asleep = True
+
+    def _trigger(self, reg):
+        if reg & 0x80 and self._field(0x01, 0, 2) == 0:
+            self._convert()
+        return reg & 0x7F
+
+    # The bus interface. Each of the part's own transfers starts its CRC over afterwards.
+
+    def hear(self, byte):
+        self.heard.append(byte)
+
+    def mem_read(self, reg, nbytes):
+        self._begin()
+        try:
+            return self._read(self._trigger(reg), nbytes)
+        finally:
+            self.heard = bytearray()
+
+    def mem_write(self, reg, data):
+        self._begin()
+        self._write(self._trigger(reg), data)
+        self.heard = bytearray()
+
+    def raw_read(self, nbytes):
+        self._begin()
+        try:
+            return self._read(self.pointer, nbytes)
+        finally:
+            self.heard = bytearray()
+
+    def raw_write(self, data):
+        self._begin()
+        self.pointer = self._trigger(data[0])
+        if len(data) > 1:
+            self._write(self.pointer, data[1:])
+        self.heard = bytearray()
+
+
+# %% [markdown]
+# ### validation/test
+# A helper that attaches a fresh `FakeTMAG5273` (a B1 at `0x22`) to a fake bus, shared by the
+# validation cells and the test file. The checks below talk to the fake with raw bus calls
+# (`readfrom_mem`, `writeto_mem`, ...) and the datasheet's register numbers: the driver is not
+# defined yet, and the fake must stand on its own.
+
+# %%
+# %%extract ../../../tests/test_tmag5273.py -a
+def fake_part(addr=0x22, **part_kw):
+    """``(bus, part)``: a fresh ``FakeTMAG5273`` at ``addr`` on a fake bus, no mux."""
+    bus = FakeBus()
+    part = bus.attach(addr, FakeTMAG5273(addr=addr, **part_kw))
+    return bus, part
+
+
+# %% [markdown]
+# #### validation: nominal usage
+# Read the identification registers, turn on X, Y and Z in continuous mode, and read the result
+# registers back. At ±40 mT, 5 mT is `0x1000` and -5 mT is `0xF000` (Equation 10).
+
+# %%
+bus, part = fake_part()
+ident = bus.readfrom_mem(0x22, 0x0C, 4)
+print("I2C_ADDRESS, DEVICE_ID, MANUFACTURER_ID LSB, MSB:", ident.hex(" "))
+bus.writeto_mem(0x22, 0x02, b"\x70")  # SENSOR_CONFIG_1: MAG_CH_EN = XYZ
+bus.writeto_mem(0x22, 0x01, b"\x02")  # DEVICE_CONFIG_2: continuous
+print("X, Y, Z result words:", bus.readfrom_mem(0x22, 0x12, 6).hex(" "))
+print("CONV_STATUS: {:#04x} | conversions so far: {}".format(
+    bus.readfrom_mem(0x22, 0x18, 1)[0], part.conversions))  # fmt: skip
+
+# %% [markdown]
+# #### validation: anti-nominal usage
+# After a write that selects sleep, the next transfer wakes the part but is not acknowledged.
+# The part is in standby afterwards and answers again.
+
+# %%
+bus, part = fake_part()
+bus.writeto_mem(0x22, 0x01, b"\x01")  # DEVICE_CONFIG_2: OPERATING_MODE = sleep
+try:
+    bus.readfrom_mem(0x22, 0x0D, 1)  # the first transfer to a sleeping part only wakes it
+except OSError as err:
+    print("raised OSError, as expected:\n    {}".format(err))
+else:
+    raise AssertionError("a transfer to a sleeping part should have raised OSError")
+finally:
+    print("then DEVICE_ID = {:#04x}, OPERATING_MODE = {}".format(
+        bus.readfrom_mem(0x22, 0x0D, 1)[0], bus.readfrom_mem(0x22, 0x01, 1)[0] & 3))  # fmt: skip
+
+# %% [markdown]
+# #### unit
+
+# %% [markdown]
+# The fake's CRC reproduces every worked example in rev C, section 6.5.1.3.6.
+
+# %%
+# %%extract ../../../tests/test_tmag5273.py -a --strip-ipytest
+# %%ipytest
+
+
+@pytest.mark.parametrize(
+    "data, want",
+    [(b"\x00", 0xF3), (b"\xff", 0x00), (b"\x80", 0x7A), (b"\x4c", 0x10), (b"\xe0", 0x5D),
+     (b"\x00\x00\x00\x00", 0xD1), (b"\xff\xff\xff\xff", 0x0F)],
+)  # fmt: skip
+def test_fake_crc_matches_datasheet(data, want):
+    assert crc8_07(data) == want
+
+
+# %% [markdown]
+# `FakeTMAG5273()` works with no arguments (an A1 at `0x35`), and the class says it needs its
+# address.
+
+# %%
+# %%extract ../../../tests/test_tmag5273.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_defaults_and_takes_addr():
+    part = FakeTMAG5273()
+    assert FakeTMAG5273.TAKES_ADDR is True
+    assert (part.addr, part.version, part.regs[0x0C]) == (0x35, 1, 0x35 << 1)
+
+
+# %% [markdown]
+# Power-on values: `I2C_ADDRESS` holds the address, `VER`, "TI" LSB first, `POR` set, the INT
+# line high, every config register 0.
+
+# %%
+# %%extract ../../../tests/test_tmag5273.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_power_on_registers():
+    bus, _ = fake_part(version=2)
+    assert bus.readfrom_mem(0x22, 0x0C, 4) == bytes([0x22 << 1, 2, 0x49, 0x54])
+    assert bus.readfrom_mem(0x22, 0x18, 1)[0] & 0x10  # POR
+    assert bus.readfrom_mem(0x22, 0x1C, 1)[0] == 0x10  # INTB_RB only
+    assert bus.readfrom_mem(0x22, 0x00, 0x0C) == bytes(0x0C)
+
+
+# %% [markdown]
+# ID and result registers ignore writes; reserved bits read 0.
+
+# %%
+# %%extract ../../../tests/test_tmag5273.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_read_only_and_reserved_bits():
+    bus, _ = fake_part()
+    bus.writeto_mem(0x22, 0x03, b"\xff")  # SENSOR_CONFIG_2: bit 7 reserved
+    bus.writeto_mem(0x22, 0x08, b"\xff")  # INT_CONFIG_1: bit 1 reserved
+    bus.writeto_mem(0x22, 0x0D, b"\x07")  # DEVICE_ID
+    bus.writeto_mem(0x22, 0x12, b"\x12\x34")  # X result
+    assert bus.readfrom_mem(0x22, 0x03, 1) == b"\x7f"
+    assert bus.readfrom_mem(0x22, 0x08, 1) == b"\xfd"
+    assert bus.readfrom_mem(0x22, 0x0D, 1) == b"\x01"
+    assert bus.readfrom_mem(0x22, 0x12, 2) == b"\x00\x00"
+
+
+# %% [markdown]
+# `POR` and the `DEVICE_STATUS` errors are write-1-to-clear: writing 0 leaves them, writing 1
+# clears them, and `INTB_RB` is not clearable.
+
+# %%
+# %%extract ../../../tests/test_tmag5273.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_status_bits_are_write_1_to_clear():
+    bus, part = fake_part()
+    part.regs[0x1C] |= 0x0F  # every error flag up
+    bus.writeto_mem(0x22, 0x18, b"\x00")
+    assert bus.readfrom_mem(0x22, 0x18, 1)[0] & 0x10
+    bus.writeto_mem(0x22, 0x18, b"\x10")
+    assert not bus.readfrom_mem(0x22, 0x18, 1)[0] & 0x10
+    bus.writeto_mem(0x22, 0x1C, b"\xff")
+    assert bus.readfrom_mem(0x22, 0x1C, 1) == b"\x10"
+
+
+# %% [markdown]
+# In standby the part converts only when the address byte has bit 7 set; in continuous mode it
+# converts before every transfer. Each conversion rolls `SET_COUNT` and sets `RESULT_STATUS`.
+
+# %%
+# %%extract ../../../tests/test_tmag5273.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_converts_on_trigger_or_continuously():
+    bus, part = fake_part()
+    bus.writeto_mem(0x22, 0x02, b"\x70")  # XYZ, standby
+    assert bus.readfrom_mem(0x22, 0x12, 2) == b"\x00\x00" and part.conversions == 0
+    status = bus.readfrom_mem(0x22, 0x18 | 0x80, 1)[0]  # trigger, then read CONV_STATUS
+    assert part.conversions == 1 and status & 0x01 and status >> 5 == 1
+    assert bus.readfrom_mem(0x22, 0x12, 2) == b"\x10\x00"
+    bus.writeto_mem(0x22, 0x01, b"\x02")  # continuous
+    before = part.conversions
+    bus.readfrom_mem(0x22, 0x12, 2)
+    bus.readfrom_mem(0x22, 0x12, 2)
+    assert part.conversions == before + 2
+
+
+# %% [markdown]
+# Result words follow Equation 10 at the selected range (the same field reads half the counts
+# at ±80 mT) and Equation 12 for temperature (26 C is 17508 + 58).
+
+# %%
+# %%extract ../../../tests/test_tmag5273.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_result_words_follow_the_equations():
+    bus, _ = fake_part(field_mT=(5.0, -5.0, 20.0), temp_c=26.0)
+    bus.writeto_mem(0x22, 0x02, b"\x70")  # XYZ
+    bus.writeto_mem(0x22, 0x07, b"\x01")  # T_CH_EN
+    bus.writeto_mem(0x22, 0x01, b"\x02")  # continuous
+    assert bus.readfrom_mem(0x22, 0x10, 8) == bytes.fromhex("449e 1000 f000 4000")
+    bus.writeto_mem(0x22, 0x03, b"\x03")  # both ranges +-80 mT
+    assert bus.readfrom_mem(0x22, 0x12, 6) == bytes.fromhex("0800 f800 2000")
+
+
+# %% [markdown]
+# With the `XY` angle pair the angle register holds `atan2(Y, X)` in sixteenths of a degree,
+# after the offset correction (Equation 16: code `0x80` is -2.5 mT at ±40 mT).
+
+# %%
+# %%extract ../../../tests/test_tmag5273.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_angle_and_offsets_use_the_pair():
+    bus, _ = fake_part(field_mT=(5.0, -5.0, 0.0))
+    bus.writeto_mem(0x22, 0x02, b"\x70")  # XYZ
+    bus.writeto_mem(0x22, 0x03, b"\x04")  # ANGLE_EN = XY
+    bus.writeto_mem(0x22, 0x01, b"\x02")  # continuous
+    assert bus.readfrom_mem(0x22, 0x19, 2) == (315 << 4).to_bytes(2, "big")
+    bus.writeto_mem(0x22, 0x0A, b"\x80")  # X offset -2.5 mT
+    assert bus.readfrom_mem(0x22, 0x12, 2) == b"\x08\x00"  # 2.5 mT
+
+
+# %% [markdown]
+# A fast16 read streams the axes once each in name order (`ZX`: Z then X), then `CONV_STATUS`,
+# then a CRC over the address bytes the part heard (here just its own read command) and the data.
+
+# %%
+# %%extract ../../../tests/test_tmag5273.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_fast_packet_order_and_crc():
+    bus, _ = fake_part(field_mT=(5.0, -5.0, 2.5))
+    bus.writeto_mem(0x22, 0x02, b"\x50")  # MAG_CH_EN = ZX
+    bus.writeto_mem(0x22, 0x01, b"\x02")  # continuous
+    bus.writeto_mem(0x22, 0x00, b"\x81")  # CRC_EN, I2C_RD = fast16
+    packet = bus.readfrom(0x22, 6)
+    assert packet[:4] == bytes.fromhex("0800 1000")  # Z = 2.5 mT, then X = 5 mT
+    assert packet[4] & 0x01  # CONV_STATUS.RESULT_STATUS
+    assert packet[5] == crc8_07(bytes([(0x22 << 1) | 1]) + packet[:5])
+
+
+# %% [markdown]
+# Behind a mux, the channel-select write's address byte is part of the CRC too: the part hears it.
+
+# %%
+# %%extract ../../../tests/test_tmag5273.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_fast_crc_covers_overheard_address_bytes():
+    bus = FakeBus()
+    mux = bus.attach(0x70, FakeMux())
+    mux.state = 0x01
+    bus.attach(0x22, FakeTMAG5273(addr=0x22), path=[(0x70, 0)])
+    bus.writeto_mem(0x22, 0x02, b"\x30")  # XY
+    bus.writeto_mem(0x22, 0x01, b"\x02")  # continuous
+    bus.writeto_mem(0x22, 0x00, b"\x81")  # CRC_EN, fast16
+    bus.writeto(0x70, b"\x01")  # a channel select the part overhears
+    packet = bus.readfrom(0x22, 6)
+    assert packet[-1] == crc8_07(bytes([0x70 << 1, (0x22 << 1) | 1]) + packet[:-1])
+
+
+# %% [markdown]
+# With `CRC_EN` a standard read longer than four bytes gets the CRC of the four data bytes as its
+# fifth byte.
+
+# %%
+# %%extract ../../../tests/test_tmag5273.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_standard_read_crc_is_the_fifth_byte():
+    bus, _ = fake_part()
+    bus.writeto_mem(0x22, 0x00, b"\x80")  # CRC_EN, standard reads
+    data = bus.readfrom_mem(0x22, 0x0C, 5)
+    assert data[:4] == bytes([0x22 << 1, 1, 0x49, 0x54])
+    assert data[4] == crc8_07(data[:4])
+    assert len(bus.readfrom_mem(0x22, 0x0C, 4)) == 4
+
+
+# %% [markdown]
+# In a fast read mode a register read returns the packet, not the register.
+
+# %%
+# %%extract ../../../tests/test_tmag5273.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_register_read_in_fast_mode_returns_the_packet():
+    bus, _ = fake_part()
+    bus.writeto_mem(0x22, 0x02, b"\x30")  # XY
+    bus.writeto_mem(0x22, 0x01, b"\x02")  # continuous
+    bus.writeto_mem(0x22, 0x00, b"\x01")  # fast16, no CRC
+    assert bus.readfrom_mem(0x22, 0x0D, 3) == bus.readfrom(0x22, 3) == b"\x10\x00\xf0"
+
+
+# %% [markdown]
+# Sleep and wake-and-sleep: the first transfer afterwards raises `OSError`, then the part is in
+# standby and answers.
+
+# %%
+# %%extract ../../../tests/test_tmag5273.py -a --strip-ipytest
+# %%ipytest
+
+
+@pytest.mark.parametrize("mode", [1, 3])
+def test_fake_sleep_nacks_the_waking_transfer(mode):
+    bus, part = fake_part()
+    bus.writeto_mem(0x22, 0x01, bytes([mode]))
+    assert part.asleep
+    with pytest.raises(OSError):
+        bus.readfrom_mem(0x22, 0x0D, 1)
+    assert bus.readfrom_mem(0x22, 0x01, 1)[0] & 0x03 == 0  # standby
+    assert bus.readfrom_mem(0x22, 0x0D, 1) == b"\x01"
+
+
+# %% [markdown]
+# `corrupt = n` flips one bit in each of the next `n` fast-read packets, then stops.
+
+# %%
+# %%extract ../../../tests/test_tmag5273.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_corrupt_flips_one_bit_per_packet():
+    bus, part = fake_part()
+    bus.writeto_mem(0x22, 0x02, b"\x10")  # X, standby: no conversion between the reads
+    bus.readfrom_mem(0x22, 0x18 | 0x80, 1)  # one triggered conversion
+    bus.writeto_mem(0x22, 0x00, b"\x01")  # fast16
+    good = bus.readfrom(0x22, 3)
+    part.corrupt = 1
+    bad = bus.readfrom(0x22, 3)
+    assert bad[0] == good[0] ^ 0x01 and bad[1:] == good[1:]
+    assert bus.readfrom(0x22, 3) == good and part.corrupt == 0
+
+
+# %% [markdown]
+# The field and the temperature accept signals, read at **conversion time**: in standby the
+# result registers keep what the last triggered conversion saw, however far the signal has moved
+# since.
+
+# %%
+# %%extract ../../../tests/test_tmag5273.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_signals_are_read_at_conversion_time():
+    with SimClock() as clock:
+        bus, _ = fake_part(field_mT=(ramp(0.0, 10.0, 0, 10), 0.0, sine(0.0, 5.0, 20)),
+                           temp_c=ramp(25.0, 35.0, 0, 10))  # fmt: skip
+        bus.writeto_mem(0x22, 0x02, b"\x50")  # ZX, standby
+        bus.writeto_mem(0x22, 0x07, b"\x01")  # T_CH_EN
+        clock.advance(5)
+        bus.readfrom_mem(0x22, 0x18 | 0x80, 1)  # convert at t = 5 s
+        at5 = bus.readfrom_mem(0x22, 0x10, 8)
+        assert at5[0:2] == (17508 + 5 * 58).to_bytes(2, "big")  # 30 C, half way up
+        assert at5[2:4] == b"\x10\x00"  # X = 5 mT, half way up
+        assert at5[6:8] == b"\x10\x00"  # Z = 5 sin(pi / 2) = 5 mT
+        clock.advance(5)
+        assert bus.readfrom_mem(0x22, 0x10, 8) == at5  # no conversion, no change
+        bus.readfrom_mem(0x22, 0x18 | 0x80, 1)  # convert at t = 10 s
+        at10 = bus.readfrom_mem(0x22, 0x10, 8)
+        assert at10[2:4] == b"\x20\x00" and at10[6:8] == b"\x00\x00"  # X 10 mT, Z 0
+
 
 # %% [markdown]
 # # Code
@@ -1905,6 +2527,140 @@ def test_reset_flag_recovers_a_part_left_in_fast_mode():
 
 
 # %% [markdown]
+# ### validation/test: in simulated time
+# A magnet on a turntable above the part, turning once a minute, while it is lowered towards the
+# part over two minutes. The fake's field is three signals: X and Y are a 20 mT circle
+# ($X = 20\cos(2\pi t/60)$, $Y = 20\sin(2\pi t/60)$, two `sine`s a quarter turn apart), and Z is a
+# `ramp` from 0.5 mT to 30 mT. With the `XY` angle pair the driver's `angle()` should read
+# $6t$ degrees, and Z should follow the ramp. Everything runs inside `SimClock`, so the two
+# minutes take no time and give the same numbers on every run.
+#
+# The helper is shared with the test file.
+
+# %%
+# %%extract ../../../tests/test_tmag5273.py -a
+TURN_S = 60.0  # one turn of the turntable
+LOWER_S = 120.0  # time to lower the magnet from 0.5 mT to 30 mT on Z
+
+
+def turntable_magnet(radius_mT=20.0):
+    """(X, Y, Z) signals: a magnet turning once per ``TURN_S`` in the XY plane, lowered on Z."""
+    x = sine(0.0, radius_mT, TURN_S, phase_s=-TURN_S / 4)  # a cosine
+    y = sine(0.0, radius_mT, TURN_S)
+    z = ramp(0.5, 30.0, 0.0, LOWER_S)
+    return (x, y, z)
+
+
+def turntable_angle(t_s):
+    """Where the magnet points at ``t_s``, in degrees: one turn per ``TURN_S``."""
+    return (360.0 * t_s / TURN_S) % 360.0
+
+
+def angle_error(a, b):
+    """The difference between two angles in degrees, across the 0/360 wrap."""
+    return abs((a - b + 180.0) % 360.0 - 180.0)
+
+
+# %% [markdown]
+# #### validation: nominal usage
+# Read the driver every 15 s of simulated time for two minutes.
+
+# %%
+with SimClock() as clock:
+    mag, part = on_fake(TMAG5273, field_mT=turntable_magnet())
+    mag.configure(channels="XYZ")
+    mag.angle_pair = "XY"
+    for _ in range(9):
+        t = clock.now_s()
+        x, y, z = mag.magnetic()
+        print("t = {:5.1f} s | angle {:8.4f} deg (magnet at {:5.1f}) | X {:6.2f} Y {:6.2f} Z {:5.2f} mT".format(
+            t, mag.angle(), turntable_angle(t), x, y, z))  # fmt: skip
+        clock.advance(15)
+
+# %% [markdown]
+# #### validation: anti-nominal usage
+# In standby the part converts only on a trigger, so without one the reading stays where the
+# last conversion left it while the magnet keeps turning. This is the part's behaviour, not an
+# error: the check prints both readings.
+
+# %%
+with SimClock() as clock:
+    mag, part = on_fake(TMAG5273, field_mT=turntable_magnet())
+    mag.configure(channels="XYZ", mode="standby")
+    mag.angle_pair = "XY"
+    mag.trigger()
+    first = mag.angle()
+    clock.advance(15)
+    print("15 s later, no trigger: {:.4f} deg (was {:.4f})".format(mag.angle(), first))
+    mag.trigger()
+    print("after a trigger:        {:.4f} deg (magnet at {:.1f})".format(
+        mag.angle(), turntable_angle(clock.now_s())))  # fmt: skip
+
+# %% [markdown]
+# #### unit
+
+# %% [markdown]
+# The hardware angle follows the turning magnet to within a sixteenth of a degree (the
+# register's resolution) plus the field quantisation, all the way round.
+
+# %%
+# %%extract ../../../tests/test_tmag5273.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_angle_follows_a_turning_magnet():
+    with SimClock() as clock:
+        mag, _ = on_fake(TMAG5273, field_mT=turntable_magnet())
+        mag.configure(channels="XYZ")
+        mag.angle_pair = "XY"
+        for _ in range(24):
+            assert angle_error(mag.angle(), turntable_angle(clock.now_s())) < 0.1
+            clock.advance(TURN_S / 24 + 0.3)
+
+
+# %% [markdown]
+# A CRC-checked fast16 read follows Z as the magnet comes down the ramp.
+
+# %%
+# %%extract ../../../tests/test_tmag5273.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fast_read_follows_an_approaching_magnet():
+    with SimClock() as clock:
+        mag, _ = on_fake(TMAG5273, field_mT=turntable_magnet())
+        mag.configure(channels="XYZ")
+        mag.crc_enabled = True
+        mag.read_mode = "fast16"
+        for _ in range(7):
+            want = 0.5 + (30.0 - 0.5) * min(clock.now_s(), LOWER_S) / LOWER_S
+            assert mag.fast_read()[0]["Z"] == pytest.approx(want, abs=2 * 40.0 / 65536)
+            clock.advance(20)
+
+
+# %% [markdown]
+# A triggered reading in standby is the value at the trigger: the die warming along a `ramp`
+# reads 30 C at 5 s and stays 30 C until the next trigger.
+
+# %%
+# %%extract ../../../tests/test_tmag5273.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_triggered_temperature_is_the_value_at_the_trigger():
+    with SimClock() as clock:
+        mag, _ = on_fake(TMAG5273, temp_c=ramp(25.0, 35.0, 0.0, 10.0))
+        mag.configure(channels="X", temperature=True, mode="standby")
+        clock.advance(5)
+        mag.trigger()
+        assert mag.temperature() == pytest.approx(30.0, abs=0.02)
+        clock.advance(5)
+        assert mag.temperature() == pytest.approx(30.0, abs=0.02)
+        mag.trigger()
+        assert mag.temperature() == pytest.approx(35.0, abs=0.02)
+
+
+# %% [markdown]
 # # Hardware validation
 #
 # > ## ⚠️ STOP — do not run this section unattended
@@ -1926,10 +2682,10 @@ def test_reset_flag_recovers_a_part_left_in_fast_mode():
 # | **Runs on** | CPython 3.13.15 in the micropylab kernel (1.0.0a1), no board | Unexpected Maker FeatherS3 (ESP32-S3), MicroPython 1.28.0 (v1.28.0, 2026-04-06), USB `/dev/ttyACM0` |
 # | **I2C bus** | `FakeBus` | `machine.I2C(1)`, **bus 1**, scl=15 sda=16, 100 kHz (`bus_open("feathers3", 1)`) |
 # | **Mux** | `FakeMux` at `0x70`, channel 0, only in tests that ask for it (`mux=True`); the rest talk to the part directly | SparkFun Qwiic Mux (TCA9548A) at `0x70` (address jumpers open), **channel 0** |
-# | **Sensor** | `FakeTMAG5273`: a B1 at `0x22`, power-on state, field (5, -5, 0) mT, 25 C | SparkFun Qwiic TMAG5273, a **B1** (TMAG5273B1) at `0x22` |
+# | **Sensor** | `FakeTMAG5273` (`tmag5273_fake`): a B1 at `0x22`, power-on state, field (5, -5, 0) mT, 25 C, or signals in simulated time | SparkFun Qwiic TMAG5273, a **B1** (TMAG5273B1) at `0x22` |
 # | **Other parts used** | none | TMP102 at `0x48` on mux channel 2: the reference for the temperature check |
 # | **Datasheet** | TI SLYS045C (rev C, April 2026) | same |
-# | **Result** | 36 unit tests pass | 79 of 79 hardware checks passed (2026-11-14) |
+# | **Result** | 54 unit tests pass (90 cases): 15 for the fake, 39 for the driver, 3 of them in simulated time | 79 of 79 hardware checks passed (2026-11-14) |
 #
 # Nothing else on bus 1 is touched. Bus 0 is not used by this notebook. To rerun the hardware
 # section, wire the bench this way again (README "The bench").
