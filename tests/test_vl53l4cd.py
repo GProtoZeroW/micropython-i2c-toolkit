@@ -6,7 +6,7 @@ from micropython_i2c.devices.sensors.distance.vl53l4cd_fake import FakeVL53L4CD
 from micropython_i2c.sim.bus import FakeBus
 from micropython_i2c.sim.clock import SimClock
 from micropython_i2c.sim.signals import ramp
-# Source: vl53l4cd_devNB.ipynb | Cell In[14] | 2026-11-16 13:38:48
+# Source: vl53l4cd_devNB.ipynb | Cell In[14] | 2026-11-16 14:32:26
 def test_fake_reference_registers_follow_table_7():
     bus = FakeBus()
     bus.attach(0x29, FakeVL53L4CD())
@@ -16,7 +16,7 @@ def test_fake_reference_registers_follow_table_7():
     assert bus.readfrom_mem(0x29, 0x00E5, 1, addrsize=16) == b"\x03"
     assert bus.readfrom_mem(0x30, 0x00E5, 1, addrsize=16) == b"\x00"
 
-# Source: vl53l4cd_devNB.ipynb | Cell In[15] | 2026-11-16 13:38:48
+# Source: vl53l4cd_devNB.ipynb | Cell In[15] | 2026-11-16 14:32:27
 def test_fake_new_sample_only_after_an_interrupt_clear():
     with SimClock() as clock:
         bus = FakeBus()
@@ -30,7 +30,7 @@ def test_fake_new_sample_only_after_an_interrupt_clear():
         clock.advance(0.050)
         assert bus.readfrom_mem(0x29, 0x0031, 1, addrsize=16) == b"\x00" and part.samples == 2
 
-# Source: vl53l4cd_devNB.ipynb | Cell In[16] | 2026-11-16 13:38:48
+# Source: vl53l4cd_devNB.ipynb | Cell In[16] | 2026-11-16 14:32:27
 @pytest.mark.parametrize("stop", [0x00, 0x80])
 def test_fake_stop_ends_the_samples(stop):
     with SimClock() as clock:
@@ -42,7 +42,7 @@ def test_fake_stop_ends_the_samples(stop):
         clock.advance(1)
         assert bus.readfrom_mem(0x29, 0x0031, 1, addrsize=16) == b"\x01" and part.samples == 0
 
-# Source: vl53l4cd_devNB.ipynb | Cell In[17] | 2026-11-16 13:38:48
+# Source: vl53l4cd_devNB.ipynb | Cell In[17] | 2026-11-16 14:32:27
 def test_fake_quantities_are_read_when_sampled():
     with SimClock() as clock:
         bus = FakeBus()
@@ -58,17 +58,17 @@ def test_fake_quantities_are_read_when_sampled():
         assert bus.readfrom_mem(0x29, 0x0096, 2, addrsize=16) == (400).to_bytes(2, "big")
         assert bus.readfrom_mem(0x29, 0x0089, 1, addrsize=16) == b"\x04"
 
-# Source: vl53l4cd_devNB.ipynb | Cell In[21] | 2026-11-16 13:38:49
+# Source: vl53l4cd_devNB.ipynb | Cell In[21] | 2026-11-16 14:32:28
 def test_init_table_covers_its_range():
     from_table = dict(zip(range(0x2D, 0x88), _INIT))
     assert len(_INIT) == 0x87 - 0x2D + 1 == 91
     assert from_table[0x30] & 0x10 and from_table[0x87] == 0x00 and from_table[0x86] == 0x00
 
-# Source: vl53l4cd_devNB.ipynb | Cell In[22] | 2026-11-16 13:38:49
+# Source: vl53l4cd_devNB.ipynb | Cell In[22] | 2026-11-16 14:32:28
 def test_only_status_9_is_valid():
     assert [s for s, name in STATUS_NAMES.items() if name == "valid"] == [9]
 
-# Source: vl53l4cd_devNB.ipynb | Cell In[24] | 2026-11-16 13:38:49
+# Source: vl53l4cd_devNB.ipynb | Cell In[24] | 2026-11-16 14:32:28
 BUDGET_CASES = [10, 20, 33, 50, 100, 200]
 
 
@@ -76,13 +76,13 @@ def periods(word):
     """Macro periods a range-config word stands for: ``(mantissa + 1) << exponent``."""
     return ((word & 0xFF) + 1) << (word >> 8)
 
-# Source: vl53l4cd_devNB.ipynb | Cell In[27] | 2026-11-16 13:38:49
+# Source: vl53l4cd_devNB.ipynb | Cell In[27] | 2026-11-16 14:32:28
 def test_budget_words_fit_registers():
     for ms in (10, 50, 200):
         for word in VL53L4CD.range_config_words(ms, 0x0BB8):
             assert 0 <= word <= 0xFFFF and word & 0xFF <= 0xFF
 
-# Source: vl53l4cd_devNB.ipynb | Cell In[28] | 2026-11-16 13:38:49
+# Source: vl53l4cd_devNB.ipynb | Cell In[28] | 2026-11-16 14:32:28
 def test_budget_words_grow_with_the_budget():
     words = [VL53L4CD.range_config_words(ms, 0x0BB8) for ms in BUDGET_CASES]
     for i in (0, 1):
@@ -90,24 +90,24 @@ def test_budget_words_grow_with_the_budget():
         assert counts == sorted(counts) and counts[0] < counts[-1]
     assert all(periods(b) > periods(a) for a, b in words)
 
-# Source: vl53l4cd_devNB.ipynb | Cell In[29] | 2026-11-16 13:38:50
+# Source: vl53l4cd_devNB.ipynb | Cell In[29] | 2026-11-16 14:32:29
 def on_fake(addr=0x29, **part_kw):
     """``(tof, part)``: a ``VL53L4CD`` on a fresh ``FakeVL53L4CD(**part_kw)`` at ``addr``."""
     bus = FakeBus()
     part = bus.attach(addr, FakeVL53L4CD(addr=addr, **part_kw))
     return VL53L4CD(I2CConnection(bus, addr)), part
 
-# Source: vl53l4cd_devNB.ipynb | Cell In[33] | 2026-11-16 13:38:50
+# Source: vl53l4cd_devNB.ipynb | Cell In[33] | 2026-11-16 14:32:29
 def test_init_loads_the_table_and_sets_50_ms():
     tof, part = on_fake()
-    assert tof.timing_budget == 50 and not tof.ranging and part.mode == 0x00
+    assert tof.timing_budget == 50 and not tof.ranging and not part.ranging
     assert (0x002D, bytes(_INIT)) in part.writes and part.regs[0x002D] == 0x12
     assert (0x0087, b"\x40") in part.writes and part.samples >= 1
     assert any(e[0] == "rm" and e[2] == 0x010F for e in tof.conn.bus.log)
     words = VL53L4CD.range_config_words(50, 0x0BB8)
     assert [int.from_bytes(part.regs[r : r + 2], "big") for r in (0x005E, 0x0061)] == words
 
-# Source: vl53l4cd_devNB.ipynb | Cell In[34] | 2026-11-16 13:38:50
+# Source: vl53l4cd_devNB.ipynb | Cell In[34] | 2026-11-16 14:32:29
 def test_reads_distance_when_started():
     tof, _ = on_fake(distance_mm=456)
     assert tof.status_name == "no reading yet"
@@ -115,7 +115,7 @@ def test_reads_distance_when_started():
     assert tof.read() == 456 and tof.valid and tof.status_name == "valid"
     tof.stop()
 
-# Source: vl53l4cd_devNB.ipynb | Cell In[35] | 2026-11-16 13:38:50
+# Source: vl53l4cd_devNB.ipynb | Cell In[35] | 2026-11-16 14:32:29
 def test_each_read_is_a_new_sample():
     tof, part = on_fake()
     tof.start()
@@ -125,7 +125,22 @@ def test_each_read_is_a_new_sample():
     tof.stop()
     assert part.samples - before >= 3 and not tof.ranging
 
-# Source: vl53l4cd_devNB.ipynb | Cell In[36] | 2026-11-16 13:38:50
+# Source: vl53l4cd_devNB.ipynb | Cell In[36] | 2026-11-16 14:32:30
+def test_stop_writes_the_uld_stop_value_and_ends_the_samples():
+    with SimClock() as clock:
+        tof, part = on_fake()
+        tof.start()
+        tof.read()
+        tof.stop()
+        assert part.writes[-1] == (0x0087, bytes([0x80]))
+        assert not tof.ranging and not part.ranging
+        tof.reg_write(tof.REG_INTERRUPT_CLEAR, 0x01)  # drop a sample already due before stop
+        made = part.samples
+        clock.advance(1.0)
+        part.mem_read(0x0031, 1)  # let the fake catch up with the simulated second
+        assert part.samples == made
+
+# Source: vl53l4cd_devNB.ipynb | Cell In[37] | 2026-11-16 14:32:30
 def test_timing_budget_rules():
     tof, _ = on_fake()
     tof.start()
@@ -138,7 +153,7 @@ def test_timing_budget_rules():
     tof.timing_budget = 100
     assert tof.timing_budget == 100
 
-# Source: vl53l4cd_devNB.ipynb | Cell In[37] | 2026-11-16 13:38:51
+# Source: vl53l4cd_devNB.ipynb | Cell In[38] | 2026-11-16 14:32:30
 def test_init_refuses_another_model():
     bus = FakeBus()
     part = bus.attach(0x29, FakeVL53L4CD())
@@ -146,19 +161,19 @@ def test_init_refuses_another_model():
     with pytest.raises(RuntimeError, match="not a VL53L4CD"):
         VL53L4CD(I2CConnection(bus, 0x29))
 
-# Source: vl53l4cd_devNB.ipynb | Cell In[38] | 2026-11-16 13:38:51
+# Source: vl53l4cd_devNB.ipynb | Cell In[39] | 2026-11-16 14:32:31
 def test_init_times_out_without_boot():
     with SimClock() as clock:
         with pytest.raises(OSError, match="boot timeout"):
             on_fake(booted=False)
         assert 1.0 <= clock.now_s() < 1.1
 
-# Source: vl53l4cd_devNB.ipynb | Cell In[39] | 2026-11-16 13:38:51
+# Source: vl53l4cd_devNB.ipynb | Cell In[40] | 2026-11-16 14:32:31
 def test_oscillator_zero_is_refused():
     with pytest.raises(OSError, match="oscillator"):
         on_fake(osc=0)
 
-# Source: vl53l4cd_devNB.ipynb | Cell In[40] | 2026-11-16 13:38:51
+# Source: vl53l4cd_devNB.ipynb | Cell In[41] | 2026-11-16 14:32:31
 def test_invalid_status_is_flagged():
     tof, _ = on_fake(status=4)
     tof.start()
@@ -167,13 +182,13 @@ def test_invalid_status_is_flagged():
     assert tof.read_valid(tries=3) is None
     tof.stop()
 
-# Source: vl53l4cd_devNB.ipynb | Cell In[41] | 2026-11-16 13:38:51
+# Source: vl53l4cd_devNB.ipynb | Cell In[42] | 2026-11-16 14:32:32
 def test_read_times_out_when_not_started():
     tof, _ = on_fake()
     with pytest.raises(OSError, match="read timeout"):
         tof.read(timeout_ms=20)
 
-# Source: vl53l4cd_devNB.ipynb | Cell In[44] | 2026-11-16 13:38:52
+# Source: vl53l4cd_devNB.ipynb | Cell In[45] | 2026-11-16 14:32:32
 def test_follows_a_hand_approaching_in_simulated_time():
     hand = ramp(1200, 30, 0, 60)
     with SimClock() as clock:
@@ -188,7 +203,7 @@ def test_follows_a_hand_approaching_in_simulated_time():
         tof.stop()
     assert readings == sorted(readings, reverse=True) and readings[-1] <= 35
 
-# Source: vl53l4cd_devNB.ipynb | Cell In[45] | 2026-11-16 13:38:52
+# Source: vl53l4cd_devNB.ipynb | Cell In[46] | 2026-11-16 14:32:32
 def test_reads_come_one_sample_apart_in_simulated_time():
     with SimClock() as clock:
         tof, _ = on_fake(sample_ms=50)

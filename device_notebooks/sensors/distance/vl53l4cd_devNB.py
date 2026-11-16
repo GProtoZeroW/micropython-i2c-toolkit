@@ -56,9 +56,11 @@
 # # TODO:
 # - Run the hardware section and fill in the results (this notebook has not been run on the
 #   hardware yet). The driver itself was used on bus 0 on 2026-11-13, before this notebook.
-# - The driver's `stop()` writes `0x00` to `0x0087`; ST's ULD and the Adafruit library write
-#   `0x80`. The diagnostic "Does `stop()` stop ranging?" checks what the real part does with
-#   each. Change the driver only after that has run.
+# - The diagnostic "Does `stop()` stop ranging?" checks both stop values on the real part; it
+#   should print "stopped" for `0x80`.
+#
+# Fixed (2026-11-16): `stop()` wrote `0x00` to `0x0087`. ST's ULD (`VL53L4CD_StopRanging`) and
+# the Adafruit library write `0x80`; the driver now does too (`STOP_RANGING`).
 #
 # Decided (2026-11-16): this notebook replaces the hand-written
 # `src/micropython_i2c/devices/sensors/distance/vl53l4cd.py`. The driver is ported unchanged
@@ -218,7 +220,7 @@ from micropython_i2c.sim.signals import ramp
 #     Standby --> Ranging: 0x0087 = 0x21 (0x40 for the VHV calibration)
 #     Ranging --> Ready: sample done, interrupt line active (0x0031 bit 0)
 #     Ready --> Ranging: clear interrupt 0x0086 = 1
-#     Ranging --> Standby: 0x0087 = 0x00 (the driver; the ULD writes 0x80)
+#     Ranging --> Standby: 0x0087 = 0x80 (as the ULD)
 # ```
 #
 # A sample takes the **timing budget**. If the interrupt is not cleared, ranging holds
@@ -304,7 +306,7 @@ __all__ = ["FakeVL53L4CD"]
 # | `0x010F`, `0x0110` read `EB AA`, and ignore writes | datasheet Table 7 |
 # | `0x00E5` reads `0x03` once booted; with `booted=False` it reads 0 | Adafruit library (ULD `SensorInit`) waits for `0x03`; datasheet 2.7 (boot within 1.2 ms) |
 # | `0x0006` holds the oscillator word, `0x0BB8` by default | Adafruit library (ULD `SetRangeTiming`) reads it; `0x0BB8` is the old `fake_vl53l4cd()`'s value, not measured |
-# | `0x0087` = `0x21` (continuous) or `0x40` (autonomous, used for the VHV calibration) ranges; any other value stops | ULD `StartRanging` and `SensorInit`; the ULD stops with `0x80`, the driver with `0x00`, and the fake stops on both |
+# | `0x0087` = `0x21` (continuous) or `0x40` (autonomous, used for the VHV calibration) ranges; any other value stops | ULD `StartRanging`, `StopRanging` (`0x80`, what the driver writes) and `SensorInit`; the fake stops on any other value |
 # | a sample is ready `sample_ms` after a start, or after an interrupt clear while ranging; until cleared, ranging holds | datasheet 2.9; `sample_ms` (default 2 ms) is the fake's, not the timing budget, so tests stay fast |
 # | the interrupt line is `0x0031` bit 0; `0x0030` bit 4 set makes it active low (set at power-up here, and by the init table) | Adafruit library `data_ready` (ULD `CheckForDataReady`) |
 # | a sample writes the raw status to `0x0089` and the distance to `0x0096` (16 bits) | Adafruit library (ULD `GetResult`) |
@@ -731,6 +733,7 @@ class VL53L4CD(RegisterI2CBase, I2CDevice):
 
     START_RANGING = 0x21
     START_VHV = 0x40
+    STOP_RANGING = 0x80  # ST ULD VL53L4CD_StopRanging (the Adafruit library writes the same)
 
     def __init__(self, conn, **kwargs):
         super().__init__(conn, **kwargs)
@@ -788,7 +791,7 @@ class VL53L4CD(RegisterI2CBase, I2CDevice):
 
     def stop(self):
         """Stop ranging. Required before changing ``timing_budget``."""
-        self.reg_write(self.REG_SYSTEM_START, 0x00)
+        self.reg_write(self.REG_SYSTEM_START, self.STOP_RANGING)
         self.ranging = False
 
     def read(self, timeout_ms=1000):
@@ -1014,7 +1017,7 @@ finally:
 
 def test_init_loads_the_table_and_sets_50_ms():
     tof, part = on_fake()
-    assert tof.timing_budget == 50 and not tof.ranging and part.mode == 0x00
+    assert tof.timing_budget == 50 and not tof.ranging and not part.ranging
     assert (0x002D, bytes(_INIT)) in part.writes and part.regs[0x002D] == 0x12
     assert (0x0087, b"\x40") in part.writes and part.samples >= 1
     assert any(e[0] == "rm" and e[2] == 0x010F for e in tof.conn.bus.log)
@@ -1055,6 +1058,29 @@ def test_each_read_is_a_new_sample():
         tof.read()
     tof.stop()
     assert part.samples - before >= 3 and not tof.ranging
+
+
+# %% [markdown]
+# `stop()` writes the ULD's stop value, and the samples end.
+
+# %%
+# %%extract ../../../tests/test_vl53l4cd.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_stop_writes_the_uld_stop_value_and_ends_the_samples():
+    with SimClock() as clock:
+        tof, part = on_fake()
+        tof.start()
+        tof.read()
+        tof.stop()
+        assert part.writes[-1] == (0x0087, bytes([0x80]))
+        assert not tof.ranging and not part.ranging
+        tof.reg_write(tof.REG_INTERRUPT_CLEAR, 0x01)  # drop a sample already due before stop
+        made = part.samples
+        clock.advance(1.0)
+        part.mem_read(0x0031, 1)  # let the fake catch up with the simulated second
+        assert part.samples == made
 
 
 # %% [markdown]
@@ -1759,10 +1785,10 @@ finally:
 
 # %% [markdown]
 # ### Does `stop()` stop ranging?
-# The driver's `stop()` writes `0x00` to `0x0087`; ST's ULD and the Adafruit library write
-# `0x80`. For each value: start, read one sample, write the value, clear the interrupt, wait
-# 300 ms, and see whether a new sample arrived. "stopped" for both means the driver is fine as it
-# is.
+# The driver's `stop()` writes `0x80` to `0x0087`, as ST's ULD does (until 2026-11-16 it wrote
+# `0x00`). For each value: start, read one sample, write the value, clear the interrupt, wait
+# 300 ms, and see whether a new sample arrived. `0x80` must print "stopped"; `0x00` is shown for
+# the record.
 #
 # **What to do:** nothing.
 
