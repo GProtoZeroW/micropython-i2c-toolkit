@@ -26,7 +26,7 @@
 Usage on the board::
 
     from micropython_i2c import I2CConnection
-    from micropython_i2c.drivers.vl53l4cd import VL53L4CD
+    from micropython_i2c.devices.sensors.distance.vl53l4cd import VL53L4CD
 
     tof = VL53L4CD(I2CConnection(bus, 0x29, lock=bus_lock))
     tof.start()

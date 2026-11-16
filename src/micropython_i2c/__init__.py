@@ -12,11 +12,11 @@ Layers, bottom up::
     I2CNode -> I2CDevice | I2CMux      datasheet facts + 4-method transport
     BitTools / CRCMixin                stateless helpers | checksum contract
     RegisterI2CBase / CommandI2CBase   protocol mixins, transport-agnostic
-    drivers.*                          TMP102, TMAG5273, SHTC3, TCA9548A
+    devices.{sensors,drivers,muxes}.*  concrete parts, by type
     RoutingTable / I2CManager          config -> validated topology -> live objects
 
-Drivers live in ``micropython_i2c.drivers`` and are imported on demand. See
-``docs/design.md`` in the repo for the reasoning behind each layer.
+Devices live in ``micropython_i2c.devices`` (``sensors``, ``drivers``, ``muxes``) and are
+imported on demand. See ``docs/design.md`` in the repo for the reasoning behind each layer.
 """
 
 from .bits import BitTools

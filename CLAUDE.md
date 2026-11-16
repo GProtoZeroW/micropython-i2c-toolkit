@@ -20,19 +20,30 @@ PyVISA-style I2C connection layer, drivers and mux-aware routing for MicroPython
 - Tests and lint: `uv run pytest`, `uv run ruff check`.
 
 ## Layout and workflow
-- Library code is written notebook-first in `dev_notebooks/<name>_devNB.py` (jupytext percent)
-  paired with `<name>_devNB.ipynb`. A subpackage module is `<pkg>_<module>_devNB`
-  (`drivers_tmp102_devNB` writes `src/micropython_i2c/drivers/tmp102.py`).
-- Run dev notebooks from `dev_notebooks/`. `%%extract` writes `../src/micropython_i2c/...`;
-  test cells append to `../tests/test_<module>.py`.
+- Library code is written notebook-first: jupytext percent `<name>_devNB.py` paired with
+  `<name>_devNB.ipynb`.
+  - `dev_notebooks/` is for the system the devices run on (connection, routing, manager, ...):
+    `<module>_devNB` writes `src/micropython_i2c/<module>.py`.
+  - `device_notebooks/` is for specific parts, in the same tree as
+    `src/micropython_i2c/devices/`: `drivers/` (outputs: SparkFun relay, Adafruit MCP23017),
+    `muxes/`, and `sensors/<kind>/` with kinds `environmental/` (temperature, humidity),
+    `magnetic/`, `distance/` (optical ToF). `device_notebooks/sensors/environmental/tmp102_devNB`
+    writes `src/micropython_i2c/devices/sensors/environmental/tmp102.py`. New type or kind: add
+    the folder in both trees, with an `__init__.py` in the package one. Register each part in
+    `devices/__init__.py` `DRIVERS` by its path under `devices` (`"sensors.magnetic.tmag5273"`).
+- Run a notebook from its own folder. `%%extract` paths are relative to it (`../src/...` from
+  `dev_notebooks/`, `../../src/...` from `device_notebooks/muxes/`, `../../../src/...` from
+  `device_notebooks/sensors/<kind>/`); test cells append to the flat `tests/test_<module>.py`.
 - Never hand-edit a file a dev notebook generates (it says so in its docstring). Edit the
-  notebook and re-run it. Converted so far: `drivers/tmp102.py`, `drivers/tca9548a.py`, `drivers/tmag5273.py`, `drivers/shtc3.py`. Every other module is still
-  hand-written until its dev notebook exists.
+  notebook and re-run it. Converted so far: `devices/sensors/environmental/{tmp102,shtc3}.py`,
+  `devices/sensors/magnetic/tmag5273.py`, `devices/sensors/distance/vl53l1x.py`,
+  `devices/muxes/tca9548a.py`. Every other module is still hand-written until its notebook
+  exists.
 - When a module is converted, add its module and test file to the generated-files lists in
   `pyproject.toml` (`I001` per-file ignore and `[tool.ruff.format] exclude`): the extractor's
   header spacing is not ruff's, and the files are rewritten on every run.
-- Never run `ruff check --fix` with import sorting on `dev_notebooks/*.py`: it moves imports
-  across cells (I001 is off there for that reason).
+- Never run `ruff check --fix` with import sorting on `dev_notebooks/*.py` or
+  `device_notebooks/**/*.py`: it moves imports across cells (I001 is off there for that reason).
 - Run model (decided 2026-11-13): a dev notebook runs on the host first (code, validation and
   unit tests against `micropython_i2c.fakes`, no board needed), then a final
   `# Hardware validation` section connects, uploads `src/micropython_i2c` with

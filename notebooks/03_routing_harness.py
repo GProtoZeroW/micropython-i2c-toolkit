@@ -61,7 +61,7 @@ for name in [m for m in sys.modules if m.startswith("micropython_i2c")]:
 
 from micropython_i2c.boards import board_get
 from micropython_i2c.compat import sleep_ms
-from micropython_i2c.drivers import registry
+from micropython_i2c.devices import registry
 from micropython_i2c.manager import I2CManager
 from micropython_i2c.routing import ConfigError, RoutingTable
 

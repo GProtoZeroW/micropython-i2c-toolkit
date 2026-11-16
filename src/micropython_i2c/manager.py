@@ -77,7 +77,7 @@ class I2CManager:
 
     Args:
         table: A validated ``RoutingTable``.
-        registry: ``{driver name: class}``, e.g. ``drivers.registry()``.
+        registry: ``{driver name: class}``, e.g. ``devices.registry()``.
         board: A ``boards.BOARDS`` key or a board dict.
 
     Attributes:

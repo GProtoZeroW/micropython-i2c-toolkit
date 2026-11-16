@@ -41,7 +41,7 @@ class FakeRegisterPart:
 class FakeTMP102:
     """16-bit pointer-register part behaving like a TMP102, quirks included.
 
-    Two behaviours measured on a real part (``drivers_tmp102_devNB`` diagnostics, 2026-11-13):
+    Two behaviours measured on a real part (``tmp102_devNB`` diagnostics, 2026-11-13):
 
     * After EM changes, D0 of the temperature word follows EM at once, but the data keeps the
       old 12/13-bit format until the next conversion (about 60 ms later at 4 Hz). In shutdown
@@ -149,7 +149,7 @@ class FakeSHTC3:
     * ``CMD_READ_ID`` makes the next read return ``id_word``. Soft reset returns to idle. A
       wake-up to a part that is already awake is acknowledged.
 
-    All of this was measured on a SparkFun SHTC3 (``drivers_shtc3_devNB`` diagnostics,
+    All of this was measured on a SparkFun SHTC3 (``shtc3_devNB`` diagnostics,
     2026-11-14); the real refusal after a NACK lasts under 1 ms, the fake's ``REFUSE_MS`` is
     longer so a test can see it at ms resolution. Set ``corrupt`` to the number of upcoming
     reads to flip one bit in.
@@ -262,8 +262,16 @@ class FakeBus:
                 return False
         return True
 
+    @staticmethod
+    def _addr_of(addr, part):
+        """The address a part answers at: its ``bus_addr`` if it has one (a part with a
+        programmable address), else the one it was attached at."""
+        return getattr(part, "bus_addr", addr)
+
     def _targets(self, addr):
-        hits = [part for p, a, part in self.nodes if a == addr and self._visible(p)]
+        hits = [
+            part for p, a, part in self.nodes if self._addr_of(a, part) == addr and self._visible(p)
+        ]
         if not hits:
             raise OSError(19, "ENODEV")
         return hits
@@ -277,7 +285,7 @@ class FakeBus:
         return hits[0]
 
     def scan(self):
-        return sorted({a for p, a, _ in self.nodes if self._visible(p)})
+        return sorted({self._addr_of(a, part) for p, a, part in self.nodes if self._visible(p)})
 
     def _hear(self, addr, read):
         """Give the address byte to every part that can hear the bus and has a ``hear`` hook
@@ -352,7 +360,7 @@ class FakeTMAG5273:
       acknowledged (``OSError``); the part is then in standby.
 
     The CRC, packet-order and fast-mode behaviour was measured on a SparkFun B1
-    (``drivers_tmag5273_devNB`` diagnostics, 2026-11-13/14).
+    (``tmag5273_devNB`` diagnostics, 2026-11-13/14).
 
     The field is ``field_mT`` (X, Y, Z) and the die temperature ``temp_c``; the result words
     follow the selected range, as on the real part. Set ``corrupt`` to the number of upcoming
@@ -534,3 +542,136 @@ def fake_vl53l4cd(distance_mm=123, status=9, osc=0x0BB8):
         0x0096: distance_mm >> 8, 0x0097: distance_mm & 0xFF,
     }  # fmt: skip
     return FakeRegisterPart(regs, size=0x10000)
+
+
+class FakeVL53L1X:
+    """An ST VL53L1X register file and ranging sequencer, close enough to test a driver on the
+    host. It does not model the optics: the distance and the result fields are attributes.
+
+    Modelled from the datasheet (DS12385 rev 8) and ST's ULD driver source:
+
+    * A 16-bit register map. ``0x010F..0x0111`` read ``EA CC 10`` (datasheet Table 8),
+      ``0x00E5`` bit 0 is "booted", ``0x00DE`` holds the oscillator calibration word. The ID,
+      status, oscillator and result registers ignore writes.
+    * ``0x0087`` (mode start): ``0x40`` ranges continuously, ``0x10`` once, ``0x00`` stops.
+      A sample is ready ``sample_ms`` after the start or after the interrupt is cleared
+      (``0x0086`` bit 0); a new sample is only made after a clear, as the datasheet says.
+    * The interrupt line is ``0x0031`` bit 0; ``0x0030`` bit 4 set means active low.
+    * A sample fills the 17-byte result block at ``0x0089``: raw status, SPAD count
+      (``0x008C``, 8.8), ambient and signal rates (``/8``, kcps) and the distance
+      (``0x0096``), which includes the part-to-part offset in ``0x001E`` (11.2, signed).
+    * ``0x0001`` is the 7-bit address; the part answers there at once (``bus_addr``).
+    * A soft reset: ``0x0000`` written 0 holds the part in reset, where every register reads 0
+      (measured: an interrupted reset left a real part answering ``00`` everywhere); written 1,
+      it restores the power-on registers, address included, and boots. With ``booted=False``
+      the firmware never boots.
+
+    ``samples`` counts the samples made, ``writes`` logs ``(reg, data)`` for every write.
+    """
+
+    ID_REGS = {0x010F: 0xEA, 0x0110: 0xCC, 0x0111: 0x10}
+    READ_ONLY = set(range(0x0089, 0x009A)) | {0x0031, 0x00DE, 0x00DF, 0x00E5} | set(ID_REGS)
+
+    def __init__(self, distance_mm=500, status=9, signal_kcps=8000, ambient_kcps=400, spads=40,
+                 osc=0x0025, sample_ms=2, addr=0x29, booted=True):  # fmt: skip
+        self.distance_mm = distance_mm
+        self.status = status
+        self.signal_kcps = signal_kcps
+        self.ambient_kcps = ambient_kcps
+        self.spads = spads
+        self.osc = osc
+        self.sample_ms = sample_ms
+        self.addr_por = addr
+        self.can_boot = booted
+        self.samples = 0
+        self.writes = []
+        self._power_on(booted)
+
+    def _power_on(self, booted):
+        self.regs = bytearray(0x10000)
+        self.in_reset = False
+        self.regs[0x0000] = 0x01  # soft reset released
+        for reg, value in self.ID_REGS.items():
+            self.regs[reg] = value
+        self.regs[0x0001] = self.addr_por
+        self.regs[0x00DE], self.regs[0x00DF] = self.osc >> 8, self.osc & 0xFF
+        self.regs[0x00E5] = 1 if booted else 0
+        self.mode = 0x00
+        self.ready = False
+        self.due = None  # ticks when the next sample is ready (None: none coming)
+
+    @property
+    def bus_addr(self):
+        return self.regs[0x0001] & 0x7F
+
+    def _now(self):
+        return ticks_ms()
+
+    def _tick(self):
+        """Make the pending sample if its time has come."""
+        if self.due is not None and not self.ready and ticks_diff(self._now(), self.due) >= 0:
+            self._sample()
+            self.due = None
+            if self.mode == 0x10:  # one-shot: back to standby after its sample
+                self.mode = 0x00
+
+    def _sample(self):
+        raw = (self.regs[0x001E] << 8) | self.regs[0x001F]
+        offset = BitTools.sign_extend(raw, 13) / 4
+        mm = max(0, min(0xFFFF, int(self.distance_mm + offset)))
+        block = bytearray(17)
+        block[0] = self.status & 0x1F
+        block[3] = self.spads & 0xFF  # 0x008C: SPAD count, integer part
+        amb, sig = self.ambient_kcps // 8, self.signal_kcps // 8
+        block[7], block[8] = amb >> 8 & 0xFF, amb & 0xFF  # 0x0090
+        block[13], block[14] = mm >> 8, mm & 0xFF  # 0x0096
+        block[15], block[16] = sig >> 8 & 0xFF, sig & 0xFF  # 0x0098
+        self.regs[0x0089:0x009A] = block
+        self.ready = True
+        self.samples += 1
+
+    def _line(self):
+        active_low = bool(self.regs[0x0030] & 0x10)
+        return int(self.ready) ^ int(active_low)
+
+    def _schedule(self):
+        self.due = ticks_add(self._now(), self.sample_ms)
+
+    def mem_read(self, reg, nbytes):
+        self._tick()
+        out = bytearray()
+        for i in range(nbytes):
+            r = (reg + i) & 0xFFFF
+            if self.in_reset:
+                out.append(0)
+            else:
+                out.append(self._line() if r == 0x0031 else self.regs[r])
+        return bytes(out)
+
+    def mem_write(self, reg, data):
+        self._tick()
+        self.writes.append((reg, bytes(data)))
+        for i, value in enumerate(data):
+            r = (reg + i) & 0xFFFF
+            if r == 0x0000:
+                if value & 1 == 0:  # reset asserted: held, every register reads 0
+                    self.mode, self.ready, self.due = 0x00, False, None
+                    self.in_reset = True
+                elif self.in_reset:  # released: power-on registers, then boot
+                    self._power_on(self.can_boot)
+                continue
+            if self.in_reset:
+                continue
+            if r in self.READ_ONLY:
+                continue
+            self.regs[r] = value
+            if r == 0x0086 and value & 1:  # clear the interrupt
+                self.ready = False
+                if self.mode == 0x40:
+                    self._schedule()
+            elif r == 0x0087:
+                self.mode = value
+                if value in (0x40, 0x10):
+                    self._schedule()
+                else:
+                    self.due = None

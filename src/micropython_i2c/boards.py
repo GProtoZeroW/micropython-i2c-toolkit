@@ -12,7 +12,7 @@ BOARDS = {
         "buses": {
             0: {"scl": 9, "sda": 8, "baud_max": 400_000},
             # Second Qwiic chain. Confirmed 2026-11-13: the SparkFun mux answers here
-            # (drivers_tca9548a_devNB, "Find the mux").
+            # (tca9548a_devNB, "Find the mux").
             1: {"scl": 15, "sda": 16, "baud_max": 400_000},
         },
     },

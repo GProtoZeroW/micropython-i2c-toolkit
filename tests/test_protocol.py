@@ -3,7 +3,7 @@
 import pytest
 
 from micropython_i2c import CommandI2CBase, I2CConnection, I2CDevice
-from micropython_i2c.drivers.tmp102 import TMP102Regs
+from micropython_i2c.devices.sensors.environmental.tmp102 import TMP102Regs
 from micropython_i2c.fakes import FakeBus, FakeSensirion, FakeTMP102
 
 

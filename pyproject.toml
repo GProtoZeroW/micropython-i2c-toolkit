@@ -50,27 +50,32 @@ ignore = ["UP031", "UP032", "UP004", "B905"]  # B905: MicroPython zip() has no s
 # (it emptied a %%writefile test-file header once).
 "notebooks/*.py" = ["E402", "E501", "F821", "I001"]
 "dev_notebooks/*.py" = ["E402", "E501", "F811", "F821", "I001"]
+"device_notebooks/**/*.py" = ["E402", "E501", "F811", "F821", "I001"]
 # Files written by dev notebooks: the extractor's "# Source:" headers set the spacing, and the
 # next run rewrites them anyway. Still linted for real errors; add each converted module here.
-"src/micropython_i2c/drivers/tmp102.py" = ["I001"]
+"src/micropython_i2c/devices/sensors/environmental/tmp102.py" = ["I001"]
 "tests/test_tmp102.py" = ["I001"]
-"src/micropython_i2c/drivers/tca9548a.py" = ["I001"]
+"src/micropython_i2c/devices/muxes/tca9548a.py" = ["I001"]
 "tests/test_tca9548a.py" = ["I001"]
-"src/micropython_i2c/drivers/tmag5273.py" = ["I001"]
+"src/micropython_i2c/devices/sensors/magnetic/tmag5273.py" = ["I001"]
 "tests/test_tmag5273.py" = ["I001"]
-"src/micropython_i2c/drivers/shtc3.py" = ["I001"]
+"src/micropython_i2c/devices/sensors/environmental/shtc3.py" = ["I001"]
 "tests/test_shtc3.py" = ["I001"]
+"src/micropython_i2c/devices/sensors/distance/vl53l1x.py" = ["I001"]
+"tests/test_vl53l1x.py" = ["I001"]
 
 [tool.ruff.format]
 exclude = [  # dev-notebook output (see the per-file-ignores above)
-    "src/micropython_i2c/drivers/tmp102.py",
+    "src/micropython_i2c/devices/sensors/environmental/tmp102.py",
     "tests/test_tmp102.py",
-    "src/micropython_i2c/drivers/tca9548a.py",
+    "src/micropython_i2c/devices/muxes/tca9548a.py",
     "tests/test_tca9548a.py",
-    "src/micropython_i2c/drivers/tmag5273.py",
+    "src/micropython_i2c/devices/sensors/magnetic/tmag5273.py",
     "tests/test_tmag5273.py",
-    "src/micropython_i2c/drivers/shtc3.py",
+    "src/micropython_i2c/devices/sensors/environmental/shtc3.py",
     "tests/test_shtc3.py",
+    "src/micropython_i2c/devices/sensors/distance/vl53l1x.py",
+    "tests/test_vl53l1x.py",
 ]
 
 [tool.ruff.lint.isort]

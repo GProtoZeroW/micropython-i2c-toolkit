@@ -26,7 +26,7 @@ I2CConnection                      bound (bus, path, address); lock + mux routin
 I2CNode -> I2CDevice | I2CMux      datasheet facts + 4-method transport contract
 BitTools / CRCMixin                stateless helpers | checksum contract
 RegisterI2CBase / CommandI2CBase   protocol mixins, transport-agnostic
-drivers.*                          concrete parts
+devices.{sensors,drivers,muxes}.*  concrete parts, by type
 RoutingTable / I2CManager          config -> validated topology -> live objects
 ```
 
@@ -142,14 +142,17 @@ init-time identity reads run on a safe clock.
   `CMD_BYTES`/`CRC_*`).
 * Put datasheet facts in a `<Part>Regs` class with no methods and derive the driver from
   it. Bring-up can then drive the mixin directly against the part before driver logic
-  exists to confuse the diagnosis (see `dev_notebooks/drivers_tmp102_devNB`).
+  exists to confuse the diagnosis (see `device_notebooks/sensors/environmental/tmp102_devNB`).
 * Declare fields as `(shift, width)` tuples and coded fields as `{code: value}` dicts.
   Never open-code a shift; use `field_extract` / `field_insert`.
 * Use `sign_extend`, and strip padding *before* calling it.
 * Use the four transport methods, never `self.conn` or a bus, and never take the lock.
 * Prefer `reg_set` over `reg_write`; cache only what is genuinely stable.
 * Keep codecs as classmethods with explicit scale/mode arguments so they test offline.
-* Register the driver in `drivers/__init__.py` `DRIVERS`, and add offline tests.
+* Put the module in `devices/<type>/`: `sensors/<kind>/` (`environmental`, `magnetic`,
+  `distance`), `drivers/` for outputs such as relays and I/O expanders, or `muxes/`. Register
+  it in `devices/__init__.py` `DRIVERS` by its path under `devices`
+  (`"sensors.magnetic.tmag5273"`), and add offline tests.
 
 ## Known limitations and next steps
 

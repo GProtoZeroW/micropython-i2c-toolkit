@@ -3,7 +3,7 @@
 Usage on the board::
 
     from micropython_i2c import I2CConnection
-    from micropython_i2c.drivers.qwiic_relay import QwiicRelay
+    from micropython_i2c.devices.drivers.qwiic_relay import QwiicRelay
 
     relay = QwiicRelay(I2CConnection(bus, 0x18, lock=bus_lock))
     relay.on()

@@ -3,7 +3,7 @@
 import pytest
 
 from micropython_i2c import CommandI2CBase, I2CConnection, NullLock
-from micropython_i2c.drivers import registry
+from micropython_i2c.devices import registry
 from micropython_i2c.fakes import FakeBus, FakeMux, FakeRegisterPart, FakeSensirion
 from micropython_i2c.manager import I2CManager, scan_check
 from micropython_i2c.routing import ConfigError, RoutingTable
