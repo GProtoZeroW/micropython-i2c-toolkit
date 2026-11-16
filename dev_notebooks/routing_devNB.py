@@ -40,10 +40,17 @@
 
 # %% [markdown]
 # # TODO:
-# Open: `ConfigError` does not survive a pickle round trip. It stores the joined message in
-# `args`, so unpickling calls `ConfigError(message)` and `problems` becomes the message's
-# characters. Nothing pickles it today (the board has no `pickle`); left as it is, since the
-# public behaviour must not change in this port.
+# Nothing open.
+#
+# Fixed (2026-11-16), found while porting:
+# - `ConfigError` lost its `problems` in a pickle round trip; it now pickles by its problems.
+# - A missing required key raised a bare `KeyError` from `from_dict`, and an address that does
+#   not parse a `ValueError`; both are now a `ConfigError` listing every such entry.
+# - A channel that is not hashable (`[3]`) crashed `segments()` with `TypeError`, and `True`
+#   passed as channel 1. A channel must be a plain non-negative `int`; with a bad channel the
+#   collision and channel-range checks are skipped (they need valid channels).
+# - A mux whose driver has no `CHANNELS` (a device driver used as a mux) raised
+#   `AttributeError`; it is now reported as "not a mux driver".
 #
 # Decided (2026-11-16): the unit tests use stand-in driver classes (only `ALLOWED_ADDRS`,
 # `CHANNELS` and `addr_ok`), so a broken driver cannot break the routing tests. One
@@ -118,6 +125,8 @@ ipytest.autoconfig(raise_on_error=True)
 
 # %%
 # %%writefile ../tests/test_routing.py
+import pickle
+
 import pytest
 
 from micropython_i2c.devices import registry
@@ -127,6 +136,8 @@ from micropython_i2c.routing import ConfigError, RoutingTable
 # Notebook-only: the imports the validation and test cells use.
 
 # %%
+import pickle
+
 import pytest
 
 from micropython_i2c.devices import registry
@@ -191,7 +202,7 @@ from micropython_i2c.devices import registry
 
 # %% [markdown]
 # ## Errors and warnings
-# One error, raised only by `validate()`:
+# One error, raised by `validate()` and, for entries it cannot parse, by `from_dict()`:
 #
 # ```
 # Exception
@@ -200,7 +211,7 @@ from micropython_i2c.devices import registry
 #
 # | Error | Also a | Raised when |
 # |---|---|---|
-# | `ConfigError` | `Exception` | `validate()` found one or more problems |
+# | `ConfigError` | `Exception` | `validate()` found one or more problems, or `from_dict()` met an entry missing a required key or with an address that does not parse |
 #
 # Example message:
 #
@@ -211,8 +222,15 @@ from micropython_i2c.devices import registry
 # ```
 #
 # A missing required key (`name`, `bus`, `address`, `driver` on a device; `bus`, `address` on
-# a mux) is not a `ConfigError`: `from_dict` raises `KeyError` while parsing, before
-# `validate()` can run.
+# a mux) is reported by `from_dict`, since the table cannot be built without it:
+#
+# ```
+# routing table invalid:
+#   devices[0]: missing required key 'driver'
+#   mux:mux_a: address 'zz' does not parse
+# ```
+#
+# It pickles by its problems, so it survives a round trip (a worker process, a test runner).
 
 # %%
 # %%extract ../src/micropython_i2c/routing.py -a
@@ -222,6 +240,9 @@ class ConfigError(Exception):
     def __init__(self, problems):
         self.problems = list(problems)
         super().__init__("routing table invalid:\n  " + "\n  ".join(self.problems))
+
+    def __reduce__(self):
+        return (self.__class__, (self.problems,))
 
 
 # %% [markdown]
@@ -263,6 +284,17 @@ def test_config_error_lists_every_problem():
     assert isinstance(err, Exception)
 
 
+# %%
+# %%extract ../tests/test_routing.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_config_error_survives_a_pickle_round_trip():
+    err = pickle.loads(pickle.dumps(ConfigError(["a: first", "b: second"])))
+    assert err.problems == ["a: first", "b: second"]
+    assert str(err) == "routing table invalid:\n  a: first\n  b: second"
+
+
 # %% [markdown]
 # ## Public names
 
@@ -297,6 +329,29 @@ def _parse_addr(value):
 # %%extract ../src/micropython_i2c/routing.py -a
 def _parse_path(path):
     return [(hop[0], hop[1]) for hop in path or ()]
+
+
+# %% [markdown]
+# `_missing` and `_parse_or_report` let `from_dict` collect every entry it cannot parse into one
+# `ConfigError`, instead of stopping at the first `KeyError` or `ValueError`.
+
+# %%
+# %%extract ../src/micropython_i2c/routing.py -a
+def _missing(problems, label, entry, keys):
+    """Report each of ``keys`` absent from ``entry``; True if any was."""
+    absent = [k for k in keys if k not in entry]
+    for k in absent:
+        problems.append("{}: missing required key {!r}".format(label, k))
+    return bool(absent)
+
+
+def _parse_or_report(problems, label, what, parse, raw):
+    """``parse(raw)``, or report that it does not parse and return ``raw``."""
+    try:
+        return parse(raw)
+    except (ValueError, TypeError, IndexError, KeyError):
+        problems.append("{}: {} {!r} does not parse".format(label, what, raw))
+        return raw
 
 
 # %% [markdown]
@@ -338,28 +393,45 @@ class RoutingTable:
 
     @classmethod
     def from_dict(cls, data):
-        """Build from a parsed config dict."""
+        """Build from a parsed config dict.
+
+        Raises:
+            ConfigError: If an entry lacks a required key (``bus``, ``address`` on a mux; also
+                ``name`` and ``driver`` on a device) or has an address or path that does not
+                parse. Every such entry is listed.
+        """
+        problems = []
         muxes = {}
         for name, m in data.get("muxes", {}).items():
+            label = "mux:{}".format(name)
+            if _missing(problems, label, m, ("bus", "address")):
+                continue
             muxes[name] = {
                 "bus": m["bus"],
-                "address": _parse_addr(m["address"]),
-                "path": _parse_path(m.get("path")),
+                "address": _parse_or_report(problems, label, "address", _parse_addr, m["address"]),
+                "path": _parse_or_report(problems, label, "path", _parse_path, m.get("path")),
                 "reset_pin": m.get("reset_pin"),
                 "driver": m.get("driver"),
             }
         devices = []
-        for d in data.get("devices", []):
+        for i, d in enumerate(data.get("devices", [])):
+            label = d.get("name", "devices[{}]".format(i))
+            if _missing(problems, label, d, ("name", "bus", "address", "driver")):
+                continue
             devices.append(
                 {
                     "name": d["name"],
                     "bus": d["bus"],
-                    "address": _parse_addr(d["address"]),
-                    "path": _parse_path(d.get("path")),
+                    "address": _parse_or_report(
+                        problems, label, "address", _parse_addr, d["address"]
+                    ),
+                    "path": _parse_or_report(problems, label, "path", _parse_path, d.get("path")),
                     "driver": d["driver"],
                     "init_kwargs": d.get("init_kwargs", {}),
                 }
             )
+        if problems:
+            raise ConfigError(problems)
         return cls(list(data.get("buses", [])), muxes, devices)
 
     # Views used by the checks, the scanner and the manager.
@@ -410,11 +482,15 @@ class RoutingTable:
             if name in self.muxes:
                 problems.append("name {!r} used by both a device and a mux".format(name))
 
-    def _check_channels_nonnegative(self, problems):
+    def _check_channels_valid(self, problems):
+        """Every channel is a plain non-negative int (not a bool). True if all are."""
+        ok = True
         for label, e in self.entries():
             for name, ch in e["path"]:
-                if not isinstance(ch, int) or ch < 0:
+                if isinstance(ch, bool) or not isinstance(ch, int) or ch < 0:
                     problems.append("{}: bad channel {!r} on mux {!r}".format(label, ch, name))
+                    ok = False
+        return ok
 
     def _check_path_consistency(self, problems):
         """Every hop's mux must sit on the same bus, reached by exactly the preceding hops.
@@ -475,7 +551,12 @@ class RoutingTable:
             cls = registry.get(drv)
             if cls is None:
                 problems.append("{}: driver {!r} not in registry".format(label, drv))
-            elif not cls.addr_ok(e["address"]):
+                continue
+            if label.startswith("mux:") and getattr(cls, "CHANNELS", None) is None:
+                problems.append(
+                    "{}: driver {!r} is not a mux driver (no CHANNELS)".format(label, drv)
+                )
+            if not cls.addr_ok(e["address"]):
                 problems.append(
                     "{}: address {:#04x} not valid for {} (allowed {})".format(
                         label, e["address"], drv, [hex(a) for a in cls.ALLOWED_ADDRS]
@@ -485,11 +566,11 @@ class RoutingTable:
     def _check_channels_vs_class(self, problems, registry):
         for label, e in self.entries():
             for name, ch in e["path"]:
-                cls = registry.get(self.muxes[name].get("driver"))
-                if cls is not None and isinstance(ch, int) and not ch < cls.CHANNELS:
+                channels = getattr(registry.get(self.muxes[name].get("driver")), "CHANNELS", None)
+                if channels is not None and not ch < channels:
                     problems.append(
                         "{}: channel {} out of range 0..{} for mux {!r} ({})".format(
-                            label, ch, cls.CHANNELS - 1, name, cls.__name__
+                            label, ch, channels - 1, name, self.muxes[name]["driver"]
                         )
                     )
 
@@ -499,12 +580,12 @@ class RoutingTable:
         refs_ok = self._check_mux_refs(problems)
         self._check_buses_declared(problems)
         self._check_names_unique(problems)
-        self._check_channels_nonnegative(problems)
-        if refs_ok and self._check_path_consistency(problems):
+        channels_ok = self._check_channels_valid(problems)
+        if refs_ok and channels_ok and self._check_path_consistency(problems):
             self._check_addr_collisions(problems)
         if registry is not None:
             self._check_drivers(problems, registry)
-            if refs_ok:
+            if refs_ok and channels_ok:
                 self._check_channels_vs_class(problems, registry)
         if problems:
             raise ConfigError(problems)
@@ -626,18 +707,19 @@ print("segments:", table.segments())
 
 # %% [markdown]
 # #### validation: anti-nominal usage
-# A device without a `driver` key cannot be parsed: `from_dict` raises `KeyError` before any
-# check runs.
+# A device without a `driver` key, and a mux whose address does not parse: `from_dict` reports
+# both in one `ConfigError` before any check runs.
 
 # %%
 cfg = config()
 del cfg["devices"][0]["driver"]
+cfg["muxes"]["mux_a"]["address"] = "zz"
 try:
-    RoutingTable.loads(cfg)  # a device needs a driver
-except KeyError as err:
-    print("raised KeyError, as expected:\n    {}".format(err))
+    RoutingTable.loads(cfg)  # a device needs a driver; an address must parse
+except ConfigError as err:
+    print("raised ConfigError, as expected:\n    {}".format(err))
 else:
-    raise AssertionError("a device without a driver should have raised KeyError")
+    raise AssertionError("a device without a driver should have raised ConfigError")
 
 # %% [markdown]
 # #### unit
@@ -709,10 +791,29 @@ def test_entries_label_muxes_and_segments_group_by_route():
 # %%ipytest
 
 
-def test_missing_required_key_is_a_key_error():
+def test_missing_keys_and_bad_addresses_are_listed_together():
     cfg = config()
     del cfg["devices"][0]["driver"]
-    with pytest.raises(KeyError):
+    del cfg["devices"][1]["name"]
+    cfg["muxes"]["mux_a"]["address"] = "zz"
+    with pytest.raises(ConfigError) as info:
+        RoutingTable.loads(cfg)
+    assert info.value.problems == [
+        "mux:mux_a: address 'zz' does not parse",
+        "humidity: missing required key 'driver'",
+        "devices[1]: missing required key 'name'",
+    ]
+
+
+# %%
+# %%extract ../tests/test_routing.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_a_malformed_path_is_reported():
+    cfg = config()
+    cfg["devices"][1]["path"] = [["mux_a"]]  # a hop needs a mux and a channel
+    with pytest.raises(ConfigError, match="hall: path .* does not parse"):
         RoutingTable.loads(cfg)
 
 
@@ -820,6 +921,10 @@ def test_negative_or_non_int_channel_rejected():
     assert "bad channel -1 on mux 'mux_a'" in problems(cfg)
     cfg["devices"][1]["path"] = [["mux_a", "3"]]
     assert "bad channel '3' on mux 'mux_a'" in problems(cfg)
+    cfg["devices"][1]["path"] = [["mux_a", True]]  # a bool is not a channel number
+    assert "bad channel True on mux 'mux_a'" in problems(cfg)
+    cfg["devices"][1]["path"] = [["mux_a", [3]]]  # unhashable: used to crash segments()
+    assert "bad channel [3] on mux 'mux_a'" in problems(cfg)
 
 
 # %%
@@ -1024,6 +1129,17 @@ def test_mux_without_driver_reported_with_registry():
     del cfg["muxes"]["mux_a"]["driver"]
     assert "mux:mux_a: no driver given" in problems(cfg)
     RoutingTable.loads(cfg).validate()  # structural checks do not need a driver
+
+
+# %%
+# %%extract ../tests/test_routing.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_a_device_driver_used_as_a_mux_is_reported():
+    cfg = config()
+    cfg["muxes"]["mux_a"]["driver"] = "TMAG5273"  # no CHANNELS: not a mux
+    assert "mux:mux_a: driver 'TMAG5273' is not a mux driver (no CHANNELS)" in problems(cfg)
 
 
 # %% [markdown]
