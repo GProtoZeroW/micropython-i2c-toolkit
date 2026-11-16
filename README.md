@@ -54,7 +54,9 @@ device_notebooks/         sources of the device modules and their fakes, by type
   muxes/tca9548a_devNB
   drivers/qwiic_relay_devNB   (MCP23017 to come)
 notebooks/                whole-bench hardware checks
-  03_routing_harness      the whole bench: config -> validate -> scan -> build -> talk
+  03_routing_harness      the whole bench: rehearsed in simulation, then config ->
+                          validate -> scan -> build -> talk on the board
+  bench.json              the bench's routing config, shared by both
 docs/design.md            why each layer is the way it is; limits and next steps
 docs/datasheets/          part datasheets
 archive/                  the original single-file notebooks and the old bring-up notebooks

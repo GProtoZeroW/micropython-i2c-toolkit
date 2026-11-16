@@ -1,0 +1,11 @@
+{
+  "buses": [1],
+  "muxes": {
+    "mux": {"bus": 1, "address": "0x70", "path": [], "driver": "TCA9548A"}
+  },
+  "devices": [
+    {"name": "hall", "bus": 1, "address": "0x22", "path": [["mux", 0]], "driver": "TMAG5273"},
+    {"name": "temp", "bus": 1, "address": "0x48", "path": [["mux", 2]], "driver": "TMP102"},
+    {"name": "tof",  "bus": 1, "address": "0x29", "path": [["mux", 7]], "driver": "VL53L1X"}
+  ]
+}
