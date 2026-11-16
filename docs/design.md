@@ -26,7 +26,8 @@ I2CConnection                      bound (bus, path, address); lock + mux routin
 I2CNode -> I2CDevice | I2CMux      datasheet facts + 4-method transport contract
 BitTools / CRCMixin                stateless helpers | checksum contract
 RegisterI2CBase / CommandI2CBase   protocol mixins, transport-agnostic
-devices.{sensors,drivers,muxes}.*  concrete parts, by type
+devices.{sensors,drivers,muxes}.*  concrete parts, by type (+ <part>_fake.py)
+sim.*                              host only: SimClock, signals, FakeBus, SimBench
 RoutingTable / I2CManager          config -> validated topology -> live objects
 ```
 
@@ -152,7 +153,12 @@ init-time identity reads run on a safe clock.
 * Put the module in `devices/<type>/`: `sensors/<kind>/` (`environmental`, `magnetic`,
   `distance`), `drivers/` for outputs such as relays and I/O expanders, or `muxes/`. Register
   it in `devices/__init__.py` `DRIVERS` by its path under `devices`
-  (`"sensors.magnetic.tmag5273"`), and add offline tests.
+  (`"sensors.magnetic.tmag5273"`), and add offline tests. (Edit the registry in
+  `dev_notebooks/devices_devNB`; it generates `devices/__init__.py`.)
+* Write the part's fake in the same device notebook (`# Fake part`, before `# Code`), next to
+  the driver as `<part>_fake.py`, and register it in `FAKES`. Model what the datasheet and
+  the bench diagnostics say, cite which for each behaviour, take time only from `compat` (no
+  busy-waits), and read physical quantities with `sim.signals.value()` so scenarios work.
 
 ## Known limitations and next steps
 
