@@ -25,11 +25,13 @@
 # > - **Hardware section:** run it one cell at a time, reading the **What to do** line above
 # >   each cell first.
 #
-# **Runs on the host first, the board last.** Everything down to `# Hardware validation` runs
-# on CPython (the notebook is not attached to a board): it writes the module and its tests and
-# checks them against a fake part. The last section connects to the FeatherS3, uploads the
-# freshly written package, checks the real TMP102 behind the mux with a matching test for every
-# unit test above, then disconnects.
+# **Where each cell runs.** Everything above `%board connect` (the first cells of
+# `# Hardware validation`) runs in ordinary Python (CPython) on this computer, with no board: it
+# writes the fake part (`tmp102_fake.py`), the driver (`tmp102.py`) and their tests, and checks
+# the driver against the fake, in real and in simulated time. After `%board connect`, cells run
+# in MicroPython on the board, except `%%host` cells, which run on the computer. That section
+# uploads the freshly written package, checks the real TMP102 behind the mux with a matching
+# test for every unit test above, then disconnects.
 #
 # micropylab has `%%extract` built in, so there is no `%load_ext jupyter_lab_extractor` cell.
 
@@ -45,7 +47,7 @@
 # | **Sensor** | `FakeTMP102` at `0x48`, power-on state, 25 C (`0x1900`) | TMP102 at `0x48` (ADD0 to GND) |
 # | **Other parts used** | none | none; the TMAG5273 (`0x22`) sat on mux channel 0, off while the TMP102 was read |
 # | **Datasheet** | TI SBOS397I | same |
-# | **Result** | 16 unit tests pass | 51 of 51 hardware checks passed (2026-11-13) |
+# | **Result** | 27 unit tests pass (8 of them on the fake part, 3 in simulated time) | 51 of 51 hardware checks passed (2026-11-13) |
 #
 # The simulation leaves the mux out (the mux has its own notebook, `tca9548a_devNB`); the
 # hardware run reaches the TMP102 through it. Bus 0 is not used by this notebook. To rerun the
@@ -57,13 +59,18 @@
 #
 # Decided (2026-11-13): this notebook replaces `notebooks/01_tmp102_bringup` (its hardware
 # checks are the `# Hardware validation` section). Unit tests run on the host against
-# `micropython_i2c.fakes.FakeTMP102`; hardware checks run on the board.
+# `FakeTMP102`; hardware checks run on the board.
+#
+# Decided (2026-11-16): `FakeTMP102` moved out of `micropython_i2c.fakes` into this notebook
+# (`tmp102_fake.py`, next to the driver). Its temperature is `temp_c`, a plain value or a signal
+# (`micropython_i2c.sim.signals`), instead of a fixed `temp_word`.
 
 # %% [markdown]
 # # Python file
-# location: `src/micropython_i2c/devices/sensors/environmental/tmp102.py`
+# location: `src/micropython_i2c/devices/sensors/environmental/tmp102.py` (driver) and
+# `src/micropython_i2c/devices/sensors/environmental/tmp102_fake.py` (fake part, host only)
 #
-# tests: `tests/test_tmp102.py`
+# tests: `tests/test_tmp102.py` (both)
 
 # %% [markdown]
 # ## header
@@ -133,17 +140,22 @@ import pytest
 
 from micropython_i2c import I2CConnection
 from micropython_i2c.devices.sensors.environmental.tmp102 import TMP102, TMP102Regs
-from micropython_i2c.fakes import FakeBus, FakeTMP102
+from micropython_i2c.devices.sensors.environmental.tmp102_fake import FakeTMP102
+from micropython_i2c.sim.bus import FakeBus
+from micropython_i2c.sim.clock import SimClock
+from micropython_i2c.sim.signals import ramp
 
 # %% [markdown]
-# Notebook-only: the imports the validation and test cells use. The classes under test are the
-# ones defined in this notebook, not the module's.
+# Notebook-only: the imports the validation and test cells use. The classes under test
+# (`FakeTMP102`, `TMP102Regs`, `TMP102`) are the ones defined in this notebook, not the modules'.
 
 # %%
 import pytest
 
 from micropython_i2c import I2CConnection
-from micropython_i2c.fakes import FakeBus, FakeTMP102
+from micropython_i2c.sim.bus import FakeBus
+from micropython_i2c.sim.clock import SimClock
+from micropython_i2c.sim.signals import ramp
 
 # %% [markdown]
 # # Intent
@@ -191,6 +203,344 @@ from micropython_i2c.fakes import FakeBus, FakeTMP102
 # |---|---|
 # | `TMP102Regs` | datasheet facts: addresses, registers, fields, verify masks, POR values, code tables |
 # | `TMP102` | the driver: temperature, config properties, thresholds, one-shot |
+
+# %% [markdown]
+# # Fake part
+# `FakeTMP102` stands in for the real part on a `FakeBus`, so the driver's tests and the
+# simulated-time scenario run on the host. It is written to its own module next to the driver,
+# `tmp102_fake.py`, and never runs on the board.
+
+# %% [markdown]
+# ## header
+
+# %%
+# %%extract ../../../src/micropython_i2c/devices/sensors/environmental/tmp102_fake.py
+"""A fake TI TMP102 (SBOS397I) for host tests and simulations, measured quirks included.
+
+Usage::
+
+    from micropython_i2c.devices.sensors.environmental.tmp102_fake import FakeTMP102
+    from micropython_i2c.sim.bus import FakeBus
+    from micropython_i2c.sim.signals import ramp
+
+    bus = FakeBus()
+    bus.attach(0x48, FakeTMP102(temp_c=ramp(20.0, 26.0, 0, 3600)))   # a room warming up
+
+The temperature is a plain number or a signal (``micropython_i2c.sim.signals``), read at each
+conversion. Time comes from ``micropython_i2c.compat``, so inside ``with SimClock():`` the part
+runs in simulated time.
+
+Host only.
+
+Generated by ``device_notebooks/sensors/environmental/tmp102_devNB``: edit the notebook, not
+this file.
+"""
+
+# %% [markdown]
+# ## Imports
+# Timing from `compat` (so `SimClock` drives the format lag) and `signals` (its `value`) to read a signal. The module is
+# imported, not `value` itself, so the name cannot clash with a variable in the notebook.
+
+# %%
+# %%extract ../../../src/micropython_i2c/devices/sensors/environmental/tmp102_fake.py -a
+from micropython_i2c.compat import ticks_add, ticks_diff, ticks_ms
+from micropython_i2c.sim import signals
+
+# %% [markdown]
+# ## Public names
+
+# %%
+# %%extract ../../../src/micropython_i2c/devices/sensors/environmental/tmp102_fake.py -a
+__all__ = ["FakeTMP102"]
+
+# %% [markdown]
+# ## `FakeTMP102`
+# What the fake models, and where each behaviour comes from:
+#
+# | Behaviour | Source |
+# |---|---|
+# | Pointer register: 2 bits pick temperature (`0`), config (`1`), T_LOW (`2`), T_HIGH (`3`); 16-bit words, MSB first | datasheet Table 6-7 |
+# | Power-on values: config `0x60A0`, T_LOW `0x4B00` (75 C), T_HIGH `0x5000` (80 C) | datasheet, config and threshold register descriptions |
+# | Temperature word left-justified two's complement, 12 bits (EM=0) or 13 bits (EM=1), 0.0625 C/LSB; D0 shows EM | datasheet Tables 6-8/6-9 |
+# | The temperature register is read-only; writes to it are ignored | datasheet Table 6-7 |
+# | R1/R0 always read `11`, AL is read-only, the low nibble of the config word reads 0 | datasheet Tables 6-10/6-11 |
+# | One-shot: writing OS=1 in shutdown runs one conversion | datasheet, one-shot (OS) bit description |
+# | After EM changes, D0 follows at once but the data keeps the old format until the next conversion (`LAG_MS` = 60 ms at 4 Hz); in shutdown until a one-shot | measured on the bench, 2026-11-13, `tmp102_devNB` diagnostics |
+# | OS reads 1 in shutdown (the last conversion is done) and 0 in continuous mode | measured on the bench, 2026-11-13, `tmp102_devNB` diagnostics |
+# | `temp_c` is read at each conversion: in continuous mode at every read of the temperature register, in shutdown only at a one-shot (entering shutdown keeps the last conversion) | simplification: the real part converts every 250 ms at 4 Hz; the fake does not model the cadence |
+# | A temperature outside the word's range saturates at its end (127.9375 C in 12-bit mode) | assumed, not measured |
+#
+# Not modelled: the ALERT comparator (AL stays at its power-on 1, "no alert" with POL=0), the
+# fault queue, the conversion time of a one-shot (OS reads 1 again at once), the SMBus alert
+# response and the general call.
+
+
+# %%
+# %%extract ../../../src/micropython_i2c/devices/sensors/environmental/tmp102_fake.py -a
+class FakeTMP102:
+    """A TMP102 behind a ``FakeBus``: four 16-bit pointer registers and the measured quirks.
+
+    Args:
+        temp_c: Die temperature in C: a number or a signal ``f(t_s)``, read at each conversion.
+
+    Attributes:
+        temp_c: As given; replace it at any time.
+        regs: ``{1: config, 2: T_LOW, 3: T_HIGH}`` as 16-bit words.
+        counts: The last conversion in counts of 1/16 C (the same in both formats), or ``None``
+            before the first one.
+        fmt_em: The format the stored temperature word is in (True: 13-bit).
+        catch_up: ``ticks_ms`` when the format catches up with EM, or ``None`` if not pending.
+    """
+
+    LSB_C = 0.0625
+    LAG_MS = 60  # measured delay before the data takes the new format (4 Hz)
+
+    def __init__(self, temp_c=25.0):
+        self.temp_c = temp_c
+        self.regs = {1: 0x60A0, 2: 0x4B00, 3: 0x5000}
+        self.counts = None
+        self.fmt_em = False
+        self.catch_up = None
+
+    def _em(self):
+        return bool(self.regs[1] & 0x0010)
+
+    def _sd(self):
+        return bool(self.regs[1] & 0x0100)
+
+    def _convert(self):
+        """One conversion: sample ``temp_c`` now."""
+        self.counts = int(round(signals.value(self.temp_c) / self.LSB_C))
+
+    def _temp_word(self):
+        if self.catch_up is not None and ticks_diff(ticks_ms(), self.catch_up) >= 0:
+            self.fmt_em, self.catch_up = self._em(), None
+        if self.counts is None or not self._sd():
+            self._convert()  # continuous mode: a fresh conversion at every read
+        shift, bits = (3, 13) if self.fmt_em else (4, 12)
+        lo, hi = -(1 << (bits - 1)), (1 << (bits - 1)) - 1
+        counts = max(lo, min(hi, self.counts))  # saturate (assumed)
+        word = (counts & ((1 << bits) - 1)) << shift
+        return word | (1 if self._em() else 0)  # D0 is the EM indicator, set at once
+
+    def mem_read(self, reg, nbytes):
+        word = self._temp_word() if reg & 3 == 0 else self.regs[reg & 3]
+        return word.to_bytes(2, "big")[:nbytes]
+
+    def mem_write(self, reg, data):
+        reg &= 3
+        word = int.from_bytes(data, "big")
+        if reg == 0:
+            return  # read-only
+        if reg != 1:
+            self.regs[reg] = word
+            return
+        old = self.regs[1]
+        one_shot = bool(word & 0x8000) and bool(word & 0x0100)
+        # R1/R0 always read 11, AL is read-only, the low nibble is reserved, OS reads SD.
+        word = (word & ~0xE020 & 0xFFF0) | 0x6000 | (old & 0x0020)
+        word |= 0x8000 if word & 0x0100 else 0
+        if word & 0x0100 and not old & 0x0100:
+            self._convert()  # entering shutdown keeps the last conversion
+        self.regs[1] = word
+        if one_shot:  # a conversion now, in the current format
+            self._convert()
+            self.fmt_em, self.catch_up = self._em(), None
+        elif (word ^ old) & 0x0010 and not word & 0x0100:  # EM changed while converting
+            self.catch_up = ticks_add(ticks_ms(), self.LAG_MS)
+
+
+# %% [markdown]
+# ### validation/test
+# A helper that reads the temperature word straight from the fake, without a bus or a driver. It
+# is shared by the validation cells and the test file.
+
+
+# %%
+# %%extract ../../../tests/test_tmp102.py -a
+def temp_word(part):
+    """The 16-bit temperature word ``part`` returns now."""
+    return int.from_bytes(part.mem_read(0, 2), "big")
+
+
+# %% [markdown]
+# #### validation: nominal usage
+# The power-on registers, a few temperatures as wire words (compare Tables 6-8/6-9: 25 C is
+# `0x1900`, -25 C is `0xE700`), and the measured EM lag in simulated time: right after EM is set,
+# D0 is 1 but the data is still 12-bit; 60 ms later it is 13-bit (25 C is `0x0C80` there).
+
+# %%
+part = FakeTMP102()
+print("power-on registers:", ", ".join("{}={:#06x}".format(r, w) for r, w in part.regs.items()))
+for t in (25.0, -25.0, 127.9375):
+    part.temp_c = t
+    print("  {:>9} C -> {:#06x}".format(t, temp_word(part)))
+part.temp_c = 25.0
+with SimClock() as clock:
+    part.mem_write(1, (part.regs[1] | 0x0010).to_bytes(2, "big"))  # EM on
+    print("EM on, at once:     {:#06x} (old 12-bit data, D0 = 1)".format(temp_word(part)))
+    clock.advance(part.LAG_MS / 1000)
+    print("EM on, 60 ms later: {:#06x} (13-bit data)".format(temp_word(part)))
+
+# %% [markdown]
+# #### validation: anti-nominal usage
+# The TMP102 has no refusal path: it acknowledges every pointer value and silently keeps
+# read-only bits. So nothing here raises; the cell shows the ignored writes instead (a write to
+# the temperature register, R1/R0 and AL cleared, the reserved low nibble set).
+
+# %%
+part = FakeTMP102()
+before = temp_word(part)
+part.mem_write(0, b"\x00\x00")  # the temperature register is read-only
+part.mem_write(1, (0x60A0 & ~0x6020 | 0x000F).to_bytes(2, "big"))  # clear R1/R0 and AL
+print("temperature word unchanged:", temp_word(part) == before)
+print("config reads {:#06x} (R1/R0 = 11, AL = 1, low nibble 0)".format(part.regs[1]))
+
+# %% [markdown]
+# #### unit
+
+# %% [markdown]
+# The power-on registers are the datasheet's.
+
+# %%
+# %%extract ../../../tests/test_tmp102.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_power_on_registers():
+    part = FakeTMP102()
+    assert [part.mem_read(r, 2) for r in (1, 2, 3)] == [b"\x60\xa0", b"\x4b\x00", b"\x50\x00"]
+    assert temp_word(part) == 0x1900  # 25 C
+
+
+# %% [markdown]
+# Temperatures become the datasheet's wire words in both formats, with D0 set in extended mode.
+
+# %%
+# %%extract ../../../tests/test_tmp102.py -a --strip-ipytest
+# %%ipytest
+
+
+@pytest.mark.parametrize("celsius, word_12, word_13", [
+    (127.9375, 0x7FF0, 0x3FF8), (25.0, 0x1900, 0x0C80), (0.25, 0x0040, 0x0020),
+    (-25.0, 0xE700, 0xF380), (-55.0, 0xC900, 0xE480)])  # fmt: skip
+def test_fake_temperature_words_match_datasheet(celsius, word_12, word_13):
+    part = FakeTMP102(temp_c=celsius)
+    assert temp_word(part) == word_12
+    part.mem_write(1, b"\x61\xb0")  # shutdown and EM on
+    part.mem_write(1, b"\xe1\xb0")  # one-shot: a conversion in the 13-bit format
+    assert temp_word(part) == word_13 | 1
+
+
+# %% [markdown]
+# A temperature beyond the 12-bit range saturates in normal mode and fits in extended mode
+# (assumed behaviour; the bench never went above 128 C).
+
+# %%
+# %%extract ../../../tests/test_tmp102.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_saturates_outside_the_format():
+    part = FakeTMP102(temp_c=140.0)
+    assert temp_word(part) == 0x7FF0
+    part.mem_write(1, b"\x61\xb0")
+    part.mem_write(1, b"\xe1\xb0")
+    assert temp_word(part) == 0x4600 | 1  # 140 C in 13 bits
+
+
+# %% [markdown]
+# Read-only bits keep their value: the temperature register, R1/R0, AL and the low nibble.
+
+# %%
+# %%extract ../../../tests/test_tmp102.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_read_only_bits_keep_their_value():
+    part = FakeTMP102()
+    part.mem_write(0, b"\x00\x00")
+    assert temp_word(part) == 0x1900
+    part.mem_write(1, b"\x00\x0f")
+    assert part.regs[1] == 0x6020
+
+
+# %% [markdown]
+# OS reads 1 in shutdown and 0 in continuous mode (measured).
+
+# %%
+# %%extract ../../../tests/test_tmp102.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_os_follows_shutdown():
+    part = FakeTMP102()
+    assert not part.regs[1] & 0x8000
+    part.mem_write(1, b"\x61\xa0")  # SD on
+    assert part.regs[1] & 0x8000
+    part.mem_write(1, b"\x60\xa0")  # SD off
+    assert not part.regs[1] & 0x8000
+
+
+# %% [markdown]
+# After EM changes in continuous mode, D0 follows at once and the data takes the new format
+# `LAG_MS` later (measured), in simulated time.
+
+# %%
+# %%extract ../../../tests/test_tmp102.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_em_format_lags_one_conversion():
+    part = FakeTMP102()
+    with SimClock() as clock:
+        part.mem_write(1, b"\x60\xb0")  # EM on
+        assert temp_word(part) == 0x1900 | 1
+        clock.advance((part.LAG_MS - 1) / 1000)
+        assert temp_word(part) == 0x1900 | 1
+        clock.advance(0.001)
+        assert temp_word(part) == 0x0C80 | 1
+
+
+# %% [markdown]
+# In shutdown the old format stays until a one-shot, however long it waits (measured).
+
+# %%
+# %%extract ../../../tests/test_tmp102.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_em_change_in_shutdown_waits_for_a_one_shot():
+    part = FakeTMP102()
+    with SimClock() as clock:
+        part.mem_write(1, b"\x61\xa0")  # shutdown
+        part.mem_write(1, b"\x61\xb0")  # EM on
+        clock.advance(10.0)
+        assert temp_word(part) == 0x1900 | 1
+        part.mem_write(1, b"\xe1\xb0")  # one-shot
+        assert temp_word(part) == 0x0C80 | 1
+
+
+# %% [markdown]
+# The temperature follows a signal in continuous mode; in shutdown it holds the last conversion
+# until a one-shot.
+
+# %%
+# %%extract ../../../tests/test_tmp102.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_temperature_follows_a_signal_and_holds_in_shutdown():
+    with SimClock() as clock:
+        part = FakeTMP102(temp_c=ramp(20.0, 30.0, 0, 100))
+        assert temp_word(part) == 0x1400  # 20 C
+        clock.advance(50)
+        assert temp_word(part) == 0x1900  # 25 C
+        part.mem_write(1, b"\x61\xa0")  # shutdown: the 25 C conversion is kept
+        clock.advance(50)
+        assert temp_word(part) == 0x1900
+        part.mem_write(1, b"\xe1\xa0")  # one-shot
+        assert temp_word(part) == 0x1E00  # 30 C
 
 # %% [markdown]
 # # Code
@@ -272,16 +622,19 @@ class TMP102Regs(RegisterI2CBase, I2CDevice):
 
 # %% [markdown]
 # ### validation/test
-# A helper that puts a `FakeTMP102` (power-on state, 25 C) on a fake bus and binds a class to it.
-# It is shared by the validation cells and the test file.
+# A helper that puts a `FakeTMP102` (power-on state, 25 C unless told otherwise) on a fake bus
+# and binds a class to it. It is shared by the validation cells and the test file.
 
 
 # %%
 # %%extract ../../../tests/test_tmp102.py -a
-def on_fake(cls, temp_word=0x1900):
-    """Bind ``cls`` to a ``FakeTMP102`` at 0x48 on a fresh fake bus (25 C by default)."""
+def on_fake(cls, temp_c=25.0):
+    """Bind ``cls`` to a ``FakeTMP102`` at 0x48 on a fresh fake bus (25 C by default).
+
+    ``temp_c`` is a number or a signal.
+    """
     bus = FakeBus()
-    bus.attach(0x48, FakeTMP102(temp_word=temp_word))
+    bus.attach(0x48, FakeTMP102(temp_c=temp_c))
     return cls(I2CConnection(bus, 0x48))
 
 
@@ -970,6 +1323,91 @@ def test_one_shot_needs_shutdown_mode():
 
 
 # %% [markdown]
+# ### validation/test: in simulated time
+# The driver against a room that warms from 20 C to 26 C over an hour (a `ramp` signal), inside
+# `with SimClock() as clock:`. `clock.advance` moves simulated time, so the hour takes
+# milliseconds; the driver's own waits (after an EM change, the one-shot poll) move it too.
+
+# %% [markdown]
+# #### validation: nominal usage
+# A reading every 10 simulated minutes in continuous mode, then the same room in shutdown mode:
+# the register holds the last conversion until `one_shot()` takes a new one.
+
+# %%
+with SimClock() as clock:
+    tmp = on_fake(TMP102, temp_c=ramp(20.0, 26.0, 0, 3600))
+    for _ in range(7):
+        print("t = {:4.0f} min: {:.4f} C".format(clock.now_s() / 60, tmp.temperature()))
+        clock.advance(600)
+    tmp.shutdown = True
+    clock.advance(1800)  # the room stays at 26 C; the part does not convert
+    print("shutdown, 30 min later: held {:.4f} C".format(tmp.temperature()))
+    print("one_shot(): {:.4f} C | simulated time {:.1f} min".format(tmp.one_shot(),
+                                                                   clock.now_s() / 60))
+
+# %% [markdown]
+# #### validation: anti-nominal usage
+# Simulated time adds no failure path: the refusals above (crossed limits, one-shot outside
+# shutdown, a stale format after an EM change in shutdown) behave the same in it, and the unit
+# tests below check the one that involves time.
+
+# %% [markdown]
+# #### unit
+
+# %% [markdown]
+# Over an hour of warming the driver follows the room to within half an LSB at every reading.
+
+# %%
+# %%extract ../../../tests/test_tmp102.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_driver_follows_a_warming_room():
+    with SimClock() as clock:
+        tmp = on_fake(TMP102, temp_c=ramp(20.0, 26.0, 0, 3600))
+        for minute in range(0, 61, 10):
+            want = 20.0 + 6.0 * minute / 60
+            assert abs(tmp.temperature() - want) <= tmp.LSB_C / 2
+            clock.advance(600)
+
+
+# %% [markdown]
+# In shutdown the reading stays at the last conversion while the room warms, and `one_shot()`
+# catches up.
+
+# %%
+# %%extract ../../../tests/test_tmp102.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_one_shot_reads_the_room_in_shutdown():
+    with SimClock() as clock:
+        tmp = on_fake(TMP102, temp_c=ramp(20.0, 26.0, 0, 3600))
+        tmp.shutdown = True
+        clock.advance(1800)
+        assert tmp.temperature() == 20.0
+        assert tmp.one_shot() == 23.0
+        assert tmp.temperature() == 23.0
+
+
+# %% [markdown]
+# Switching extended mode in continuous mode waits one conversion period plus the maximum
+# conversion time (285 ms at 4 Hz) of simulated time, longer than the fake's 60 ms lag.
+
+# %%
+# %%extract ../../../tests/test_tmp102.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_extended_mode_switch_waits_in_simulated_time():
+    with SimClock() as clock:
+        tmp = on_fake(TMP102)
+        start = clock.now_us
+        tmp.extended_mode = True
+        assert clock.now_us - start >= (250 + tmp.CONV_TIME_MAX_MS) * 1000
+        assert tmp.temperature() == 25.0
+
+# %% [markdown]
 # # Hardware validation
 #
 # > ## ⚠️ STOP — do not run this section unattended
@@ -993,7 +1431,7 @@ def test_one_shot_needs_shutdown_mode():
 # | **Sensor** | `FakeTMP102` at `0x48`, power-on state, 25 C (`0x1900`) | TMP102 at `0x48` (ADD0 to GND) |
 # | **Other parts used** | none | none; the TMAG5273 (`0x22`) sat on mux channel 0, off while the TMP102 was read |
 # | **Datasheet** | TI SBOS397I | same |
-# | **Result** | 16 unit tests pass | 51 of 51 hardware checks passed (2026-11-13) |
+# | **Result** | 27 unit tests pass (8 of them on the fake part, 3 in simulated time) | 51 of 51 hardware checks passed (2026-11-13) |
 #
 # The simulation leaves the mux out (the mux has its own notebook, `tca9548a_devNB`); the
 # hardware run reaches the TMP102 through it. Bus 0 is not used by this notebook. To rerun the

@@ -24,10 +24,13 @@
 # > - **Hardware section:** run it one cell at a time, reading the **What to do** line above
 # >   each cell first.
 #
-# **Runs on the host first, the board last**, like the other dev notebooks. Everything down to
-# `# Hardware validation` runs on CPython against `micropython_i2c.fakes.FakeSHTC3`. The last
-# section connects to the FeatherS3, uploads the freshly written package, checks the real SHTC3
-# with a matching test for every unit test above, then disconnects.
+# **Where each cell runs.** Everything above `%board connect` (the first cells of
+# `# Hardware validation`) runs in ordinary Python (CPython) on this computer, with no board: it
+# writes the fake part (`shtc3_fake.py`), the driver (`shtc3.py`) and their tests, and checks the
+# driver against `FakeSHTC3`, in real and in simulated time. After `%board connect`, cells run in
+# MicroPython on the board, except `%%host` cells, which run on the computer. That section
+# uploads the freshly written package, checks the real SHTC3 with a matching test for every unit
+# test above, then disconnects.
 
 # %% [markdown]
 # # Hardware and configuration
@@ -41,7 +44,7 @@
 # | **Sensor** | `FakeSHTC3` at `0x70`: idle (as after power-up), 25 C, 50 %RH, ID `0x0807`, measures in 11.0 ms (normal) / 0.5 ms (low power) | SparkFun Qwiic SHTC3 at `0x70` |
 # | **Other parts used** | none | none: the SHTC3 was the only part connected to the board. The TMP102 cross-check (bus 1, mux channel 2) was skipped in this run; an earlier run with it connected read 23.43 C against 22.88 C |
 # | **Datasheet** | Sensirion SHTC3, version 4, December 2022 | same |
-# | **Result** | 15 unit tests pass | 35 of 35 hardware checks passed (2026-11-14) |
+# | **Result** | 24 unit tests pass (7 of them on the fake part, 2 in simulated time) | 35 of 35 hardware checks passed (2026-11-14) |
 #
 # The simulation and the bench differ on purpose here: a mux in front of the SHTC3 would have been
 # the better test, but the bench's mux has the same address (`0x70`), so the SHTC3 sits alone on bus
@@ -69,12 +72,18 @@
 # that bus, not behind the mux. It is always at `0x70`, the mux's own address, so it cannot
 # share the mux's segment. Datasheet: Sensirion SHTC3, version 4, December 2022
 # (`docs/datasheets/Datasheet_SHTC3.pdf`).
+#
+# Decided (2026-11-16): `FakeSHTC3` moved out of `micropython_i2c.fakes` into this notebook
+# (`shtc3_fake.py`, next to the driver). `temp_c` and `rh` accept signals
+# (`micropython_i2c.sim.signals`), and a clock-stretched read sleeps out the rest of the
+# measurement instead of spinning, so the fake runs under `SimClock`.
 
 # %% [markdown]
 # # Python file
-# location: `src/micropython_i2c/devices/sensors/environmental/shtc3.py`
+# location: `src/micropython_i2c/devices/sensors/environmental/shtc3.py` (driver) and
+# `src/micropython_i2c/devices/sensors/environmental/shtc3_fake.py` (fake part, host only)
 #
-# tests: `tests/test_shtc3.py`
+# tests: `tests/test_shtc3.py` (both)
 
 # %% [markdown]
 # ## header
@@ -145,17 +154,22 @@ import pytest
 
 from micropython_i2c import I2CConnection
 from micropython_i2c.devices.sensors.environmental.shtc3 import SHTC3, SHTC3Cmds
-from micropython_i2c.fakes import FakeBus, FakeRegisterPart, FakeSHTC3
+from micropython_i2c.devices.sensors.environmental.shtc3_fake import FakeSHTC3
+from micropython_i2c.sim.bus import FakeBus, FakeRegisterPart
+from micropython_i2c.sim.clock import SimClock
+from micropython_i2c.sim.signals import ramp
 
 # %% [markdown]
-# Notebook-only: the imports the validation and test cells use. The classes under test are the
-# ones defined in this notebook, not the module's.
+# Notebook-only: the imports the validation and test cells use. The classes under test
+# (`FakeSHTC3`, `SHTC3Cmds`, `SHTC3`) are the ones defined in this notebook, not the modules'.
 
 # %%
 import pytest
 
 from micropython_i2c import I2CConnection
-from micropython_i2c.fakes import FakeBus, FakeRegisterPart, FakeSHTC3
+from micropython_i2c.sim.bus import FakeBus, FakeRegisterPart
+from micropython_i2c.sim.clock import SimClock
+from micropython_i2c.sim.signals import ramp
 
 # %% [markdown]
 # # Intent
@@ -198,6 +212,425 @@ from micropython_i2c.fakes import FakeBus, FakeRegisterPart, FakeSHTC3
 # |---|---|
 # | `SHTC3Cmds` | datasheet facts: commands (all eight measurement commands), timings, ID pattern, CRC examples |
 # | `SHTC3` | the driver: identify on construction, `measure`, `read_id`, `wake`, `soft_reset`, codecs |
+
+# %% [markdown]
+# # Fake part
+# `FakeSHTC3` stands in for the real part on a `FakeBus`, so the driver's tests and the
+# simulated-time scenario run on the host. It is written to its own module next to the driver,
+# `shtc3_fake.py`, and never runs on the board.
+
+# %% [markdown]
+# ## header
+
+# %%
+# %%extract ../../../src/micropython_i2c/devices/sensors/environmental/shtc3_fake.py
+"""A fake Sensirion SHTC3 (datasheet version 4) for host tests and simulations.
+
+Usage::
+
+    from micropython_i2c.devices.sensors.environmental.shtc3_fake import FakeSHTC3
+    from micropython_i2c.sim.bus import FakeBus
+    from micropython_i2c.sim.signals import ramp
+
+    bus = FakeBus()
+    bus.attach(0x70, FakeSHTC3(temp_c=ramp(20.0, 26.0, 0, 3600), rh=ramp(60.0, 45.0, 0, 3600)))
+
+Temperature and humidity are plain numbers or signals (``micropython_i2c.sim.signals``), read
+when a measurement command arrives. Time comes from ``micropython_i2c.compat``, so inside
+``with SimClock():`` the part runs in simulated time; a clock-stretched read sleeps out the rest
+of the measurement instead of spinning.
+
+Host only.
+
+Generated by ``device_notebooks/sensors/environmental/shtc3_devNB``: edit the notebook, not
+this file.
+"""
+
+# %% [markdown]
+# ## Imports
+# Timing from `compat` (so `SimClock` drives the measurement time) and `signals` (its `value`) to read a signal. The module is
+# imported, not `value` itself, so the name cannot clash with a variable in the notebook.
+
+# %%
+# %%extract ../../../src/micropython_i2c/devices/sensors/environmental/shtc3_fake.py -a
+from micropython_i2c.compat import sleep_us, ticks_add, ticks_diff, ticks_us
+from micropython_i2c.sim import signals
+
+# %% [markdown]
+# ## Public names
+
+# %%
+# %%extract ../../../src/micropython_i2c/devices/sensors/environmental/shtc3_fake.py -a
+__all__ = ["FakeSHTC3"]
+
+# %% [markdown]
+# ## `FakeSHTC3`
+# What the fake models, and where each behaviour comes from:
+#
+# | Behaviour | Source |
+# |---|---|
+# | Commands: wake-up `0x3517`, sleep `0xB098`, soft reset `0x805D`, read ID `0xEFC8`; anything else is NACKed | datasheet Tables 9, 10, 12, 14 |
+# | Eight measurement commands: normal or low power, temperature or humidity first, clock stretching or not | datasheet Table 11 |
+# | Words: $S_T = (T + 45)\,2^{16}/175$, $S_{RH} = RH\,2^{16}/100$, each followed by CRC-8 (poly `0x31`, init `0xFF`) | datasheet section 5.11, Table 16 |
+# | ID register `0x0807` by default (bits 11 and 5..0 identify an SHTC3) | datasheet Table 15 |
+# | Starts awake (idle), as after power-up | datasheet, power-up |
+# | In sleep only wake-up is acknowledged; every other command is NACKed | datasheet sleep mode; measured on the bench, 2026-11-14, `shtc3_devNB` diagnostics |
+# | Right after a NACKed command, wake-up is NACKed too for `REFUSE_MS` | measured on the bench, 2026-11-14, `shtc3_devNB` diagnostics (under 1 ms; the fake uses 2 ms so a test sees it at ms resolution) |
+# | A measurement lasts `MEAS_MS`: 11.0 ms normal, 0.5 ms low power; until it ends every transfer is NACKed | measured on the bench, 2026-11-14, `shtc3_devNB` diagnostics (datasheet Table 5 maximums: 12.1 ms and 0.8 ms) |
+# | A read after a clock-stretching command during the measurement waits for the result (SCL held low); the fake sleeps out the remaining time on the `compat` clock | datasheet Table 11; measured on the bench (a stretched read took 12.9 ms) |
+# | The result can be read once; a read with nothing waiting is NACKed | measured on the bench, 2026-11-14, `shtc3_devNB` diagnostics |
+# | A wake-up to a part that is already awake is acknowledged | measured on the bench, 2026-11-14, `shtc3_devNB` diagnostics |
+# | Soft reset drops a waiting result and leaves the part idle | datasheet section 5.7 |
+# | `temp_c` and `rh` are read when the measurement command arrives; words saturate at `0x0000`/`0xFFFF` | simplification (the real part samples during the measurement) |
+#
+# For tests: `corrupt` is the number of upcoming reads to flip one bit in (a CRC failure), and
+# `commands` lists every acknowledged command. Not modelled: the general-call reset, the
+# measurement's noise and the low-power mode's poorer repeatability (add `noisy` to a signal for
+# that).
+
+
+# %%
+# %%extract ../../../src/micropython_i2c/devices/sensors/environmental/shtc3_fake.py -a
+class FakeSHTC3:
+    """An SHTC3 behind a ``FakeBus``: commands, sleep, measurement timing and CRCs.
+
+    Args:
+        temp_c: Temperature in C: a number or a signal ``f(t_s)``, read at each measurement.
+        rh: Relative humidity in %RH: a number or a signal, read at each measurement.
+        id_word: What the ID register reads.
+
+    Attributes:
+        temp_c, rh: As given; replace them at any time.
+        asleep: True after the sleep command, until a wake-up.
+        pending: The words the next read returns, or ``None``.
+        stretch: True if the last measurement command uses clock stretching.
+        busy_until: ``ticks_us`` when the measurement ends, or ``None``.
+        refuse_until: ``ticks_us`` until which wake-up is NACKed, or ``None``.
+        corrupt: Number of upcoming reads to flip one bit in.
+        commands: Every acknowledged command, as an int.
+    """
+
+    WAKEUP, SLEEP, SOFT_RESET, READ_ID = 0x3517, 0xB098, 0x805D, 0xEFC8
+    # opcode -> (low_power, rh_first, clock_stretch), Table 11
+    MEASURE = {
+        0x7CA2: (False, False, True), 0x5C24: (False, True, True),
+        0x7866: (False, False, False), 0x58E0: (False, True, False),
+        0x6458: (True, False, True), 0x44DE: (True, True, True),
+        0x609C: (True, False, False), 0x401A: (True, True, False),
+    }  # fmt: skip
+    MEAS_MS = {False: 11.0, True: 0.5}  # measured; the datasheet maximums are 12.1 and 0.8
+    REFUSE_MS = 2  # measured under 1 ms; longer so a test sees it at ms resolution
+
+    def __init__(self, temp_c=25.0, rh=50.0, id_word=0x0807):
+        self.temp_c = temp_c
+        self.rh = rh
+        self.id_word = id_word
+        self.asleep = False
+        self.pending = None
+        self.stretch = False
+        self.busy_until = None
+        self.refuse_until = None
+        self.corrupt = 0
+        self.commands = []
+
+    @staticmethod
+    def crc8(data):
+        """CRC-8 of ``data``: polynomial 0x31, seeded 0xFF (Table 16)."""
+        crc = 0xFF
+        for byte in data:
+            crc ^= byte
+            for _ in range(8):
+                crc = ((crc << 1) ^ 0x31) & 0xFF if crc & 0x80 else (crc << 1) & 0xFF
+        return crc
+
+    def _left_us(self):
+        """Microseconds until the measurement ends; 0 when none is running."""
+        if self.busy_until is not None:
+            left = ticks_diff(self.busy_until, ticks_us())
+            if left > 0:
+                return left
+        self.busy_until = None
+        return 0
+
+    def _nack(self):
+        raise OSError(19, "ENODEV")
+
+    def raw_write(self, data):
+        cmd = int.from_bytes(bytes(data), "big")
+        if self.asleep and cmd != self.WAKEUP:
+            self.refuse_until = ticks_add(ticks_us(), self.REFUSE_MS * 1000)
+            self._nack()
+        if self.refuse_until is not None:
+            if ticks_diff(self.refuse_until, ticks_us()) > 0:
+                self._nack()
+            self.refuse_until = None
+        if self._left_us():
+            self._nack()
+        if cmd not in (self.WAKEUP, self.SLEEP, self.SOFT_RESET, self.READ_ID, *self.MEASURE):
+            self._nack()  # not a command
+        self.commands.append(cmd)
+        if cmd == self.WAKEUP:
+            self.asleep = False
+        elif cmd == self.SLEEP:
+            self.asleep = True
+        elif cmd == self.SOFT_RESET:
+            self.pending = None
+        elif cmd == self.READ_ID:
+            self.pending, self.stretch = [self.id_word], False
+        elif cmd in self.MEASURE:
+            low_power, rh_first, self.stretch = self.MEASURE[cmd]
+            temp_c, rh = signals.value(self.temp_c), signals.value(self.rh)  # sampled now
+            t = max(0, min(0xFFFF, int(round((temp_c + 45) * 65536 / 175))))
+            h = max(0, min(0xFFFF, int(round(rh * 65536 / 100))))
+            self.pending = [h, t] if rh_first else [t, h]
+            self.busy_until = ticks_add(ticks_us(), int(self.MEAS_MS[low_power] * 1000))
+
+    def raw_read(self, nbytes):
+        if self.asleep:
+            self._nack()
+        left = self._left_us()
+        if left:
+            if not self.stretch:
+                self._nack()
+            sleep_us(left)  # clock stretching: SCL held low until the result is ready
+            self.busy_until = None
+        if self.pending is None:
+            self._nack()  # nothing to read
+        out = bytearray()
+        for w in self.pending:
+            pair = bytes([w >> 8, w & 0xFF])
+            out += pair + bytes([self.crc8(pair)])
+        self.pending = None
+        if self.corrupt:
+            out[0] ^= 0x01
+            self.corrupt -= 1
+        return bytes(out[:nbytes])
+
+
+# %% [markdown]
+# ### validation/test
+# Two helpers shared by the validation cells and the test file: one sends a command as the bus
+# would, the other splits a read into words and checks every CRC.
+
+
+# %%
+# %%extract ../../../tests/test_shtc3.py -a
+def send(part, cmd):
+    """Write the 16-bit command ``cmd`` to ``part``, MSB first."""
+    part.raw_write(bytes([cmd >> 8, cmd & 0xFF]))
+
+
+def words_of(packet):
+    """The 16-bit words of a read, each CRC checked (``AssertionError`` if one is wrong)."""
+    words = []
+    for i in range(0, len(packet), 3):
+        assert FakeSHTC3.crc8(packet[i : i + 2]) == packet[i + 2], "bad CRC at byte {}".format(i)
+        words.append((packet[i] << 8) | packet[i + 1])
+    return words
+
+
+# %% [markdown]
+# #### validation: nominal usage
+# One measurement by hand in simulated time: the measurement command, a wait of `MEAS_MS`, the
+# read. Then a clock-stretched measurement whose read waits by itself, and the ID.
+
+# %%
+with SimClock() as clock:
+    part = FakeSHTC3(temp_c=23.7, rh=63.0)
+    send(part, 0x7866)  # normal, temperature first, no clock stretching
+    clock.advance(part.MEAS_MS[False] / 1000)
+    t_word, rh_word = words_of(part.raw_read(6))
+    print("T word {:#06x} -> {:.3f} C | RH word {:#06x} -> {:.3f} %RH".format(
+        t_word, -45 + 175 * t_word / 65536, rh_word, 100 * rh_word / 65536))  # fmt: skip
+    start = clock.now_us
+    send(part, 0x5C24)  # normal, humidity first, clock stretching
+    words_of(part.raw_read(6))
+    print("stretched read waited {} us of simulated time".format(clock.now_us - start))
+    send(part, part.READ_ID)
+    print("ID: {:#06x} | commands: {}".format(words_of(part.raw_read(3))[0],
+                                              [hex(c) for c in part.commands]))  # fmt: skip
+
+# %% [markdown]
+# #### validation: anti-nominal usage
+# A sleeping part NACKs every command but wake-up.
+
+# %%
+part = FakeSHTC3()
+send(part, part.SLEEP)
+try:
+    send(part, part.READ_ID)  # asleep: only wake-up is acknowledged
+except OSError as err:
+    print("raised OSError, as expected:\n    {}".format(err))
+else:
+    raise AssertionError("a command to a sleeping part should have raised OSError")
+
+# %% [markdown]
+# A read during a measurement without clock stretching is NACKed.
+
+# %%
+with SimClock():
+    part = FakeSHTC3()
+    send(part, 0x7866)
+    try:
+        part.raw_read(6)  # still measuring, and the command does not stretch the clock
+    except OSError as err:
+        print("raised OSError, as expected:\n    {}".format(err))
+    else:
+        raise AssertionError("a read during the measurement should have raised OSError")
+
+# %% [markdown]
+# A word that is not a command is NACKed.
+
+# %%
+part = FakeSHTC3()
+try:
+    send(part, 0x1234)  # not in the command tables
+except OSError as err:
+    print("raised OSError, as expected:\n    {}".format(err))
+else:
+    raise AssertionError("an unknown command should have raised OSError")
+
+# %% [markdown]
+# #### unit
+
+# %% [markdown]
+# With the words of Figure 7 as its temperature and humidity, a humidity-first measurement sends
+# the figure's packet byte for byte, CRCs included.
+
+# %%
+# %%extract ../../../tests/test_shtc3.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_reproduces_figure_7():
+    with SimClock() as clock:
+        part = FakeSHTC3(temp_c=-45 + 175 * 0x648B / 65536, rh=100 * 0xA133 / 65536)
+        send(part, 0x58E0)  # normal, humidity first, no clock stretching
+        clock.advance(0.011)
+        assert part.raw_read(6) == b"\xa1\x33\x1c\x64\x8b\xc7"
+
+
+# %% [markdown]
+# Every measurement command returns both words in its order, and the words decode back to the
+# values (section 5.11) within one LSB.
+
+# %%
+# %%extract ../../../tests/test_shtc3.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_measurement_commands_and_words():
+    with SimClock() as clock:
+        part = FakeSHTC3(temp_c=-10.0, rh=5.0)
+        for cmd, (_, rh_first, _) in FakeSHTC3.MEASURE.items():
+            send(part, cmd)
+            clock.advance(0.011)
+            words = words_of(part.raw_read(6))
+            t_word, rh_word = words[::-1] if rh_first else words
+            assert abs(-45 + 175 * t_word / 65536 - -10.0) <= 175 / 65536
+            assert abs(100 * rh_word / 65536 - 5.0) <= 100 / 65536
+
+
+# %% [markdown]
+# A clock-stretched read during the measurement waits for the result: it sleeps out exactly the
+# rest of `MEAS_MS` on the simulated clock (no busy-wait).
+
+# %%
+# %%extract ../../../tests/test_shtc3.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_clock_stretched_read_waits_for_the_result():
+    with SimClock() as clock:
+        part = FakeSHTC3()
+        for cmd, low_power in ((0x7CA2, False), (0x6458, True)):
+            start = clock.now_us
+            send(part, cmd)
+            clock.advance(0.0002)
+            words_of(part.raw_read(6))
+            assert clock.now_us - start == int(part.MEAS_MS[low_power] * 1000)
+
+
+# %% [markdown]
+# Without clock stretching, a read is NACKed until `MEAS_MS` has passed, then answered.
+
+# %%
+# %%extract ../../../tests/test_shtc3.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_nacks_until_the_measurement_ends():
+    with SimClock() as clock:
+        part = FakeSHTC3()
+        send(part, 0x7866)
+        clock.advance(0.0109)
+        with pytest.raises(OSError):
+            part.raw_read(6)
+        with pytest.raises(OSError):  # a command too
+            send(part, part.WAKEUP)
+        clock.advance(0.0001)
+        assert words_of(part.raw_read(6)) == [0x6666, 0x8000]  # 25 C, 50 %RH
+
+
+# %% [markdown]
+# In sleep only wake-up is acknowledged; right after a NACKed command wake-up is NACKed too, for
+# `REFUSE_MS`.
+
+# %%
+# %%extract ../../../tests/test_shtc3.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_sleep_and_the_refusal_after_a_nack():
+    with SimClock() as clock:
+        part = FakeSHTC3()
+        send(part, part.SLEEP)
+        with pytest.raises(OSError):
+            send(part, part.READ_ID)
+        with pytest.raises(OSError):
+            send(part, part.WAKEUP)
+        clock.advance(part.REFUSE_MS / 1000)
+        send(part, part.WAKEUP)
+        assert not part.asleep
+        send(part, part.WAKEUP)  # already awake: acknowledged
+
+
+# %% [markdown]
+# The result is read once; a second read, or a read after a soft reset, is NACKed.
+
+# %%
+# %%extract ../../../tests/test_shtc3.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_result_is_read_once():
+    part = FakeSHTC3()
+    send(part, part.READ_ID)
+    assert words_of(part.raw_read(3)) == [0x0807]
+    with pytest.raises(OSError):
+        part.raw_read(3)
+    send(part, part.READ_ID)
+    send(part, part.SOFT_RESET)
+    with pytest.raises(OSError):
+        part.raw_read(3)
+
+
+# %% [markdown]
+# Temperature and humidity signals are read when the measurement command arrives.
+
+# %%
+# %%extract ../../../tests/test_shtc3.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_fake_reads_signals_at_the_measurement_command():
+    with SimClock() as clock:
+        part = FakeSHTC3(temp_c=ramp(20.0, 30.0, 0, 100), rh=ramp(60.0, 40.0, 0, 100))
+        clock.advance(50)
+        send(part, 0x7CA2)
+        t_word, rh_word = words_of(part.raw_read(6))
+        assert abs(-45 + 175 * t_word / 65536 - 25.0) <= 175 / 65536
+        assert abs(100 * rh_word / 65536 - 50.0) <= 100 / 65536
 
 # %% [markdown]
 # # Code
@@ -750,6 +1183,74 @@ def test_soft_reset_leaves_it_asleep():
 
 
 # %% [markdown]
+# ### validation/test: in simulated time
+# The driver against a room that warms from 20 C to 26 C over an hour while its humidity falls
+# from 60 %RH to 45 %RH (two `ramp` signals), inside `with SimClock() as clock:`. `clock.advance`
+# moves simulated time, so the hour takes milliseconds; the driver's own waits (wake-up, the
+# measurement time) move it too.
+
+# %% [markdown]
+# #### validation: nominal usage
+# A measurement every 10 simulated minutes, and how much simulated time one measurement takes.
+
+# %%
+with SimClock() as clock:
+    sht, part = on_fake(SHTC3, temp_c=ramp(20.0, 26.0, 0, 3600), rh=ramp(60.0, 45.0, 0, 3600))
+    for _ in range(7):
+        start = clock.now_us
+        t, rh = sht.measure()
+        print("t = {:4.0f} min: {:6.2f} C {:6.2f} %RH | took {} us".format(
+            start / 60e6, t, rh, clock.now_us - start))  # fmt: skip
+        clock.advance(600)
+
+# %% [markdown]
+# #### validation: anti-nominal usage
+# Simulated time adds no failure path: the refusals above (a part that is not an SHTC3, a CRC
+# failure) behave the same in it. The fake's own timing refusals are checked under `# Fake part`.
+
+# %% [markdown]
+# #### unit
+
+# %% [markdown]
+# Over an hour the driver follows both signals to within one LSB at every measurement, in
+# normal and low-power mode.
+
+# %%
+# %%extract ../../../tests/test_shtc3.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_driver_follows_a_warming_drying_room():
+    with SimClock() as clock:
+        sht, _ = on_fake(SHTC3, temp_c=ramp(20.0, 26.0, 0, 3600), rh=ramp(60.0, 45.0, 0, 3600))
+        for _ in range(7):
+            minute = clock.now_s() / 60
+            for low_power in (False, True):
+                t, rh = sht.measure(low_power=low_power)
+                assert abs(t - (20.0 + 6.0 * minute / 60)) <= 0.01
+                assert abs(rh - (60.0 - 15.0 * minute / 60)) <= 0.01
+            clock.advance(600)
+
+
+# %% [markdown]
+# One measurement takes at least the wake-up time plus the datasheet's maximum measurement time
+# of simulated time: the driver waits instead of polling.
+
+# %%
+# %%extract ../../../tests/test_shtc3.py -a --strip-ipytest
+# %%ipytest
+
+
+def test_measure_waits_the_datasheet_time_in_simulated_time():
+    with SimClock() as clock:
+        sht, part = on_fake(SHTC3)
+        for low_power in (False, True):
+            start = clock.now_us
+            sht.measure(low_power=low_power)
+            assert clock.now_us - start >= SHTC3.T_WAKEUP_US + SHTC3.T_MEAS_US[low_power]
+            assert part.asleep
+
+# %% [markdown]
 # # Hardware validation
 #
 # > ## ⚠️ STOP — do not run this section unattended
@@ -772,7 +1273,7 @@ def test_soft_reset_leaves_it_asleep():
 # | **Sensor** | `FakeSHTC3` at `0x70`: idle (as after power-up), 25 C, 50 %RH, ID `0x0807`, measures in 11.0 ms (normal) / 0.5 ms (low power) | SparkFun Qwiic SHTC3 at `0x70` |
 # | **Other parts used** | none | none: the SHTC3 was the only part connected to the board. The TMP102 cross-check (bus 1, mux channel 2) was skipped in this run; an earlier run with it connected read 23.43 C against 22.88 C |
 # | **Datasheet** | Sensirion SHTC3, version 4, December 2022 | same |
-# | **Result** | 15 unit tests pass | 35 of 35 hardware checks passed (2026-11-14) |
+# | **Result** | 24 unit tests pass (7 of them on the fake part, 2 in simulated time) | 35 of 35 hardware checks passed (2026-11-14) |
 #
 # The simulation and the bench differ on purpose here: a mux in front of the SHTC3 would have been
 # the better test, but the bench's mux has the same address (`0x70`), so the SHTC3 sits alone on bus
